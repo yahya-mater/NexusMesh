@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NexusMesh — P2P Video</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════ SPLASH SCREEN -->
+<div id="splash" class="screen active">
+  <div class="splash-bg">
+    <div class="grid-lines"></div>
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+  </div>
+  <div class="splash-content">
+    <div class="logo-mark">
+      <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="12" cy="24" r="5" stroke="currentColor" stroke-width="2"/>
+        <circle cx="36" cy="12" r="5" stroke="currentColor" stroke-width="2"/>
+        <circle cx="36" cy="36" r="5" stroke="currentColor" stroke-width="2"/>
+        <line x1="17" y1="22" x2="31" y2="14" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 2"/>
+        <line x1="17" y1="26" x2="31" y2="34" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 2"/>
+        <line x1="31" y1="15" x2="31" y2="33" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 2"/>
+      </svg>
+    </div>
+    <h1 class="brand">NexusMesh</h1>
+    <p class="tagline">Zero-server P2P video calls.<br/>No backend. No tracking. Just peers.</p>
+    <div class="splash-actions">
+      <button class="btn btn-primary" id="btnInitiate">
+        <span class="btn-icon">⬡</span> Start a Call
+      </button>
+      <button class="btn btn-ghost" id="btnJoinFromSplash">
+        <span class="btn-icon">◈</span> Join a Call
+      </button>
+    </div>
+    <button class="settings-trigger" id="btnOpenSettings" title="Profile Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="12" cy="12" r="3"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2m-3.22-7.78-1.42 1.42M6.64 17.36l-1.42 1.42m12.74 0-1.42-1.42M6.64 6.64 5.22 5.22"/>
+      </svg>
+    </button>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ CALL SCREEN -->
+<div id="callScreen" class="screen">
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="brand-small">NexusMesh</span>
+      <div class="conn-status-wrap">
+        <span class="conn-dot" id="globalStatusDot"></span>
+        <span class="conn-label" id="globalStatusLabel">Idle</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <button class="icon-btn" id="btnAddPeer" title="Add another peer">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button class="icon-btn" id="btnOpenSettingsCall" title="Profile">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+      </button>
+      <button class="icon-btn danger" id="btnEndCall" title="End call">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92V19a2 2 0 01-2.18 2A19.79 19.79 0 012 5.18 2 2 0 014 3h2.09a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L7.09 10.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Video grid -->
+  <main class="video-grid" id="videoGrid">
+    <!-- Local tile -->
+    <div class="video-tile local-tile" id="localTile">
+      <video id="localVideo" autoplay muted playsinline></video>
+      <div class="tile-overlay">
+        <div class="peer-info" id="localInfo">
+          <span class="peer-avatar" id="localAvatar">?</span>
+          <span class="peer-name" id="localName">You</span>
+        </div>
+        <div class="tile-controls">
+          <button class="tile-btn" id="btnMuteAudio" title="Mute mic">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8"/></svg>
+          </button>
+          <button class="tile-btn" id="btnHideVideo" title="Hide camera">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 1l22 22M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><path d="M14.12 14.12a3 3 0 11-4.24-4.24"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="no-cam-placeholder" id="localNoCam">
+        <span class="placeholder-avatar" id="localPlaceholderAvatar">?</span>
+      </div>
+    </div>
+    <!-- Remote tiles injected here -->
+  </main>
+
+  <!-- Chat panel -->
+  <aside class="chat-panel" id="chatPanel">
+    <div class="chat-header">
+      <span>Messages</span>
+      <button class="icon-btn sm" id="btnCloseChat">✕</button>
+    </div>
+    <div class="chat-messages" id="chatMessages"></div>
+    <div class="chat-input-row">
+      <input type="text" id="chatInput" placeholder="Type a message…" autocomplete="off" />
+      <button class="btn btn-primary sm" id="btnSendChat">Send</button>
+    </div>
+  </aside>
+
+  <!-- Bottom controls -->
+  <footer class="callbar">
+    <button class="callbar-btn" id="btnToggleChat" title="Chat">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+      <span>Chat</span>
+      <span class="badge hidden" id="chatBadge">0</span>
+    </button>
+    <button class="callbar-btn" id="btnShareScreen" title="Share screen">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      <span>Screen</span>
+    </button>
+  </footer>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ SIGNALING MODAL -->
+<div class="modal-overlay" id="signalingModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 id="signalingTitle">Start a Call</h2>
+      <button class="icon-btn sm" id="btnCloseSignaling">✕</button>
+    </div>
+    <div class="modal-body" id="signalingBody">
+      <!-- Dynamically populated -->
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ SETTINGS MODAL -->
+<div class="modal-overlay" id="settingsModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Profile Settings</h2>
+      <button class="icon-btn sm" id="btnCloseSettings">✕</button>
+    </div>
+    <div class="modal-body">
+      <label class="field-label">Display Name</label>
+      <input type="text" id="settingsName" class="text-input" placeholder="Your name" maxlength="32" />
+
+      <label class="field-label" style="margin-top:1.2rem;">Avatar Image</label>
+      <div class="avatar-picker">
+        <div class="avatar-preview" id="avatarPreview">?</div>
+        <div class="avatar-actions">
+          <label class="btn btn-ghost sm" for="avatarFile">Upload image</label>
+          <input type="file" id="avatarFile" accept="image/*" style="display:none" />
+          <button class="btn btn-ghost sm" id="btnClearAvatar">Clear</button>
+        </div>
+      </div>
+
+      <button class="btn btn-primary" id="btnSaveSettings" style="margin-top:1.6rem;width:100%;">Save Profile</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ TOAST -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

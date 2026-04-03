@@ -21,7 +21,7 @@ const ICE_SERVERS = [
 
 const MAX_AVATAR_PX = 72;   // px — keep Base64 small
 const LINK_MAX_HASH = 4096; // chars before we warn about truncation
-const NTFY_BASE = 'https://ntfy.sh';
+const NTFY_BASE = 'https://ntfy-bqw1.onrender.com';//'https://ntfy.sh';
 const NTFY_PREFIX = 'nexusmesh';
 const NTFY_TTL = 300; // seconds — messages expire after 5 min
 

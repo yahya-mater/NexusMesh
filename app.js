@@ -228,6 +228,10 @@ function ntfyListen(roomId, leg, onMessage, onError) {
 
       es.onopen = () => {
         console.log(`[ntfy:listen:sse] ✓ Connection opened`);
+        // Immediately do a one-shot poll to catch messages published
+        // before we started listening (race condition between publish and subscribe)
+        console.log(`[ntfy:listen:sse] Running catch-up poll for pre-existing messages…`);
+        catchUpPoll();
       };
 
       es.onmessage = e => {
@@ -260,6 +264,41 @@ function ntfyListen(roomId, leg, onMessage, onError) {
     } catch (initErr) {
       console.error(`[ntfy:listen:sse] ✗ EventSource constructor threw:`, initErr);
       startPolling();
+    }
+  }
+
+  // ── One-shot catch-up poll (runs once after SSE opens)
+  async function catchUpPoll() {
+    if (closed || messageHandled) return;
+    console.log(`[ntfy:catchup] One-shot poll → ${pollUrl}`);
+    try {
+      const res = await fetch(pollUrl, { signal: AbortSignal.timeout(8000) });
+      console.log(`[ntfy:catchup] ← HTTP ${res.status}`);
+      if (!res.ok) {
+        console.warn(`[ntfy:catchup] Non-OK — skipping, SSE will handle live delivery`);
+        return;
+      }
+      const text = await res.text();
+      console.log(`[ntfy:catchup] Body length: ${text.length}`);
+      if (!text.trim()) {
+        console.log(`[ntfy:catchup] No cached messages — waiting on SSE for live delivery`);
+        return;
+      }
+      const lines = text.trim().split('\n').filter(Boolean);
+      console.log(`[ntfy:catchup] ${lines.length} line(s) to parse`);
+      for (const [i, line] of lines.entries()) {
+        let envelope;
+        try { envelope = JSON.parse(line); }
+        catch { console.warn(`[ntfy:catchup] Line ${i} parse failed`); continue; }
+        console.log(`[ntfy:catchup] Line ${i} — event: "${envelope.event}", has message: ${!!envelope.message}`);
+        if (envelope.event === 'open' || !envelope.message) continue;
+        console.log(`[ntfy:catchup] ✓ Found cached message — handling`);
+        handleMessage(envelope.message);
+        return;
+      }
+      console.log(`[ntfy:catchup] No valid cached message found — SSE standing by for live delivery`);
+    } catch (err) {
+      console.warn(`[ntfy:catchup] fetch error:`, err);
     }
   }
 

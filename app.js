@@ -21,6 +21,9 @@ const ICE_SERVERS = [
 
 const MAX_AVATAR_PX = 72;   // px — keep Base64 small
 const LINK_MAX_HASH = 4096; // chars before we warn about truncation
+const NTFY_BASE = 'https://ntfy.sh';
+const NTFY_PREFIX = 'nexusmesh';
+const NTFY_TTL = 300; // seconds — messages expire after 5 min
 
 /* ═══════════════════════════════════════════════════ STATE */
 const state = {
@@ -107,11 +110,23 @@ function uuid() {
 }
 
 function encode(obj) {
-  return btoa(encodeURIComponent(JSON.stringify(obj)));
+  const json = JSON.stringify(obj);
+  const compressed = pako.deflate(json);                     // Uint8Array
+  const binary = String.fromCharCode(...compressed);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, ''); // URL-safe Base64
 }
+
 function decode(str) {
-  try { return JSON.parse(decodeURIComponent(atob(str))); }
-  catch { return null; }
+  try {
+    // Restore standard Base64 padding and chars
+    let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    //const binary = atob(b64);
+    const binary = Array.from(compressed, b => String.fromCharCode(b)).join('');
+    const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+    const json = pako.inflate(bytes, { to: 'string' });
+    return JSON.parse(json);
+  } catch { return null; }
 }
 
 function toast(msg, type = '') {
@@ -121,6 +136,92 @@ function toast(msg, type = '') {
   DOM.toastContainer.appendChild(el);
   setTimeout(() => el.remove(), 3200);
 }
+
+/* ═══════════════════════════════════════════════════ NTFY SIGNALING */
+function ntfyTopic(roomId, leg) {
+  // leg: 'offer' or 'answer'
+  return `${NTFY_PREFIX}-${leg}-${roomId}`;
+}
+
+async function ntfyPublish(roomId, leg, payload) {
+  const topic = ntfyTopic(roomId, leg);
+  const res = await fetch(`${NTFY_BASE}/${topic}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/plain',
+      'X-TTL': String(NTFY_TTL),
+      'X-Title': 'NexusMesh Signal',
+    },
+    body: encode(payload), // reuse our pako encode
+  });
+  if (!res.ok) throw new Error(`ntfy publish failed: ${res.status}`);
+}
+
+function ntfySubscribe(roomId, leg, onMessage, onError) {
+  const topic = ntfyTopic(roomId, leg);
+  const url = `${NTFY_BASE}/${topic}/sse?poll=1`; // poll=1 gets missed msgs too
+  const es = new EventSource(url);
+  es.onmessage = e => {
+    try {
+      const envelope = JSON.parse(e.data);
+      if (!envelope.message) return;
+      const data = decode(envelope.message);
+      if (data) { es.close(); onMessage(data); }
+    } catch { /* ignore parse errors from other messages */ }
+  };
+  es.onerror = err => {
+    es.close();
+    if (onError) onError(err);
+  };
+  return es; // caller can es.close() to cancel
+}
+
+function ntfyPoll(roomId, leg, onMessage, onError) {
+  // Polling fallback — SSE sometimes blocked by corporate proxies
+  let attempts = 0;
+  const MAX = 90; // 90 × 2s = 3 minutes timeout
+  const interval = setInterval(async () => {
+    attempts++;
+    if (attempts > MAX) {
+      clearInterval(interval);
+      if (onError) onError(new Error('Polling timed out'));
+      return;
+    }
+    try {
+      const topic = ntfyTopic(roomId, leg);
+      const res = await fetch(`${NTFY_BASE}/${topic}/json?poll=1&since=all`);
+      if (!res.ok) return;
+      const text = await res.text();
+      // ntfy returns one JSON object per line
+      const lines = text.trim().split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const envelope = JSON.parse(line);
+          if (!envelope.message) continue;
+          const data = decode(envelope.message);
+          if (data) { clearInterval(interval); onMessage(data); return; }
+        } catch { continue; }
+      }
+    } catch { /* network blip, try again */ }
+  }, 2000);
+  return { close: () => clearInterval(interval) };
+}
+
+function ntfyListen(roomId, leg, onMessage, onError) {
+  // Try SSE first, fall back to polling
+  let pollHandle = null;
+  const es = ntfySubscribe(roomId, leg, onMessage, () => {
+    // SSE failed — switch to polling
+    pollHandle = ntfyPoll(roomId, leg, onMessage, onError);
+  });
+  return {
+    close: () => {
+      es.close();
+      pollHandle?.close();
+    }
+  };
+}
+
 
 function copyToClipboard(text) {
   navigator.clipboard.writeText(text)
@@ -455,7 +556,9 @@ async function initiateCall(isAddPeer = false) {
   showCallScreen();
 
   const peerId = uuid();
+  const roomId = peerId.slice(0, 10); // short room ID embedded in link
   const entry = createPeer(peerId);
+  entry.roomId = roomId;
 
   // Initiator opens the data channel
   entry.dc = entry.pc.createDataChannel('nexus', { ordered: true });
@@ -469,10 +572,32 @@ async function initiateCall(isAddPeer = false) {
   await waitForICE(entry.pc);
 
   const finalSDP = entry.pc.localDescription;
-  const encoded = encode({ type: 'offer', sdp: finalSDP, peerId });
-  const link = buildLink(encoded);
+  const offerPayload = { type: 'offer', sdp: finalSDP, peerId };
 
-  showSignalingModal('offer', { entry, encoded, link });
+  // Build the short room link (no SDP in URL)
+  const link = `${location.origin}${location.pathname}#room:${roomId}`;
+
+  // Show modal with link immediately
+  showSignalingModal('offer-ntfy', { entry, link, roomId, offerPayload });
+
+  // Publish offer to ntfy in background
+  try {
+    await ntfyPublish(roomId, 'offer', offerPayload);
+    toast('Offer published — waiting for peer…', 'success');
+  } catch (e) {
+    toast('ntfy publish failed — use manual code below', 'error');
+    console.error(e);
+  }
+
+  // Listen for answer coming back
+  const listener = ntfyListen(roomId, 'answer', async (answerData) => {
+    entry._answerListener = null;
+    await finalizeCall(entry, answerData);
+  }, (err) => {
+    console.error('Answer listener error:', err);
+    toast('Timed out waiting for answer — ask peer to retry', 'error');
+  });
+  entry._answerListener = listener;
 }
 
 /**
@@ -482,12 +607,13 @@ async function initiateCall(isAddPeer = false) {
  *  3. Create answer, wait for ICE
  *  4. Encode answer → share back
  */
-async function joinCall(offerData) {
+async function joinCall(offerData, roomId) {
   await startLocalMedia();
   showCallScreen();
   hideModal('signalingModal');
 
   const entry = createPeer(offerData.peerId || uuid());
+  entry.roomId = roomId;
 
   await entry.pc.setRemoteDescription(new RTCSessionDescription({
     type: 'offer', sdp: offerData.sdp.sdp || offerData.sdp,
@@ -499,10 +625,20 @@ async function joinCall(offerData) {
   await waitForICE(entry.pc);
 
   const finalSDP = entry.pc.localDescription;
-  const encoded = encode({ type: 'answer', sdp: finalSDP, peerId: entry.id });
-  const link = buildLink(encoded);
+  const answerPayload = { type: 'answer', sdp: finalSDP, peerId: entry.id };
 
-  showSignalingModal('answer', { entry, encoded, link });
+  // Publish answer automatically — no manual step needed
+  try {
+    await ntfyPublish(roomId, 'answer', answerPayload);
+    toast('Answer sent — connecting…', 'success');
+  } catch (e) {
+    // ntfy failed — fall back to manual
+    const encoded = encode(answerPayload);
+    const link = buildLink(encoded);
+    showSignalingModal('answer', { entry, encoded, link });
+    toast('Auto-connect failed — share answer manually', 'error');
+    console.error(e);
+  }
 }
 
 /**
@@ -542,6 +678,47 @@ function showSignalingModal(mode, ctx) {
 
   const body = DOM.signalingBody;
   body.innerHTML = '';
+
+  if (mode === 'offer-ntfy') {
+    body.innerHTML = `
+      <p class="step-label">Share this link</p>
+      <p class="step-desc">
+        Send this link to your peer. Once they open it the connection
+        establishes <strong>automatically</strong> — no code exchange needed.
+      </p>
+      <div class="link-box">
+        <input type="text" id="offerLinkInput" readonly value="${ctx.link}" />
+        <button class="btn btn-primary sm" id="btnCopyLink">Copy</button>
+      </div>
+      <div class="divider"><span>waiting for peer…</span></div>
+      <div style="display:flex;align-items:center;gap:.75rem;padding:.5rem 0;">
+        <span class="conn-dot connecting" style="width:10px;height:10px;flex-shrink:0;"></span>
+        <span style="font-size:.85rem;color:var(--txt-2);font-family:var(--font-mono);" id="ntfyStatusMsg">
+          Offer published to ntfy.sh — listening for answer…
+        </span>
+      </div>
+      <div class="divider"><span>manual fallback</span></div>
+      <p class="step-desc" style="font-size:.8rem;">
+        If auto-connect fails, copy the offer code and ask your peer
+        to paste it at <strong>Join a Call → manual code</strong>.
+      </p>
+      <textarea class="sig-box" id="offerCodeBox" readonly>${encode(ctx.offerPayload)}</textarea>
+      <div class="btn-row">
+        <button class="btn btn-ghost sm" id="btnCopyCode">Copy Offer Code</button>
+        <button class="btn btn-ghost sm danger" id="btnCancelListen">Cancel</button>
+      </div>`;
+
+    showModal('signalingModal');
+
+    $('btnCopyLink').onclick = () => copyToClipboard(ctx.link);
+    $('btnCopyCode').onclick  = () => copyToClipboard($('offerCodeBox').value);
+    $('btnCancelListen').onclick = () => {
+      ctx.entry._answerListener?.close();
+      ctx.entry._answerListener = null;
+      hideModal('signalingModal');
+    };
+    return; // important — don't fall through
+  }
 
   if (mode === 'offer') {
     const tooLong = ctx.link.length > LINK_MAX_HASH;
@@ -735,22 +912,60 @@ function endCall() {
 function checkUrlHash() {
   const hash = location.hash.slice(1);
   if (!hash) return;
-  const data = decode(hash);
-  if (!data) return;
-  // Clear hash so back-button works cleanly
   history.replaceState(null, '', location.pathname);
 
-  if (data.type === 'offer') {
-    // Auto-trigger join flow
-    DOM.btnJoinFromSplash.click();
-    // Small delay so media loads first
-    setTimeout(() => joinCall(data), 600);
-  } else if (data.type === 'answer') {
-    // Someone opened the answer link — this is unusual but handle gracefully
-    toast('Paste this answer code into the initiator\'s window', '');
-    // Show manual paste UI
-    showSignalingModal('paste-answer-hint', {});
+  // New flow — short room link
+  if (hash.startsWith('room:')) {
+    const roomId = hash.slice(5);
+    if (!roomId) return;
+    showJoinSpinner(roomId);
+    return;
   }
+
+  // Legacy flow — full SDP in hash (pako encoded)
+  const data = decode(hash);
+  if (!data) return;
+  if (data.type === 'offer') {
+    DOM.btnJoinFromSplash.click();
+    setTimeout(() => joinCall(data, null), 600);
+  }
+}
+
+function showJoinSpinner(roomId) {
+  // Show a "fetching offer…" state on the splash while ntfy delivers
+  DOM.signalingTitle.textContent = 'Joining Call…';
+  DOM.signalingBody.innerHTML = `
+    <div style="display:flex;align-items:center;gap:.75rem;padding:.75rem 0;">
+      <span class="conn-dot connecting" style="width:10px;height:10px;flex-shrink:0;"></span>
+      <span style="font-family:var(--font-mono);font-size:.88rem;color:var(--txt-2);">
+        Fetching invite from ntfy.sh…
+      </span>
+    </div>
+    <p class="step-desc">This only takes a moment. If it hangs, the invite may have expired (5 min limit).</p>
+    <div class="btn-row" style="margin-top:.5rem;">
+      <button class="btn btn-ghost sm" id="btnCancelJoin">Cancel</button>
+    </div>`;
+  showModal('signalingModal');
+
+  $('btnCancelJoin').onclick = () => {
+    listener.close();
+    hideModal('signalingModal');
+  };
+
+  const listener = ntfyListen(roomId, 'offer', async (offerData) => {
+    hideModal('signalingModal');
+    await startLocalMedia();
+    showCallScreen();
+    await joinCall(offerData, roomId);
+  }, (err) => {
+    console.error('Offer fetch error:', err);
+    $('btnCancelJoin')?.closest('.modal-body')
+      ?.querySelector('div')
+      ?.querySelector('span:last-child')
+      && ($('btnCancelJoin').closest('.modal-body').querySelector('[style*="font-mono"]').textContent
+        = 'Failed to fetch invite — ask for the manual code.');
+    toast('Could not fetch invite — use manual code', 'error');
+  });
 }
 
 /* ═══════════════════════════════════════════════════ EVENT WIRING */

@@ -118,15 +118,25 @@ function encode(obj) {
 
 function decode(str) {
   try {
-    // Restore standard Base64 padding and chars
-    let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+    // ntfy may URL-encode the message on the way out — decode first
+    let clean = str;
+    try { clean = decodeURIComponent(str); } catch { /* already clean */ }
+
+    // Restore URL-safe Base64 → standard Base64
+    let b64 = clean.replace(/-/g, '+').replace(/_/g, '/');
     while (b64.length % 4) b64 += '=';
-    //const binary = atob(b64);
-    const binary = Array.from(compressed, b => String.fromCharCode(b)).join('');
+
+    const binary = atob(b64);
     const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
     const json = pako.inflate(bytes, { to: 'string' });
-    return JSON.parse(json);
-  } catch { return null; }
+    const result = JSON.parse(json);
+    console.log(`[decode] ✓ Success — type: ${result.type}`);
+    return result;
+  } catch (err) {
+    console.warn(`[decode] ✗ Failed:`, err.message);
+    console.warn(`[decode] Input (first 80 chars): ${String(str).slice(0, 80)}`);
+    return null;
+  }
 }
 
 function toast(msg, type = '') {

@@ -36,7 +36,7 @@ const state = {
   chatOpen: false,
   unreadCount: 0,
   profile: loadProfile(),
-  localPeerId: null,   // set when first connection is initiated
+  localPeerId: uuid(), // stable for the lifetime of this tab — never reassigned
 };
 
 /*
@@ -646,6 +646,19 @@ function createPeer(id) {
     entry.status = s;
     updatePeerTileStatus(entry);
     updateGlobalStatus();
+
+    if (s === 'failed' || s === 'closed' || s === 'disconnected') {
+      console.log(`[mesh] Peer ${id} (stable: ${entry.stableId}) — state: ${s}, scheduling cleanup`);
+      // Give 8 seconds for reconnection before removing tile
+      setTimeout(() => {
+        if (entry.status === 'failed' || entry.status === 'closed' || entry.status === 'disconnected') {
+          console.log(`[mesh] Removing unrecovered peer ${id}`);
+          const name = entry.info?.name || 'A peer';
+          removePeer(id);
+          addChatMessage('system', `${name} disconnected`);
+        }
+      }, 8000);
+    }
   };
 
   // Data channel (remote side)
@@ -663,7 +676,12 @@ function setupDataChannel(entry) {
   const dc = entry.dc;
   dc.onopen = () => {
     console.log(`[${entry.id}] DataChannel open`);
-    // Send our profile
+    // Send identity first, then profile
+    dc.send(JSON.stringify({
+      type:     'identity',
+      stableId: state.localPeerId,
+      name:     state.profile.name,
+    }));
     sendProfile(entry);
   };
   dc.onmessage = e => {
@@ -690,12 +708,18 @@ function handleDataMessage(entry, msg) {
   console.log(`[mesh] message from ${entry.id} — type: ${msg.type}`);
   switch (msg.type) {
 
+    case 'identity':
+      // Store the remote peer's stable ID — this is what we use for brokering
+      entry.stableId = msg.stableId;
+      console.log(`[mesh] identity registered — connection ${entry.id} = stable ${msg.stableId}`);
+      break;
+
     case 'profile':
       entry.info = { name: msg.name, avatar: msg.avatar };
       updatePeerTileInfo(entry);
       addChatMessage('system', `${msg.name} joined`);
-      // Broker introductions to existing peers
-      brokerIntroductions(entry);
+      // Broker introductions using stable IDs — wait a tick for identity to arrive
+      setTimeout(() => brokerIntroductions(entry), 200);
       break;
 
     case 'chat':
@@ -716,48 +740,78 @@ function handleDataMessage(entry, msg) {
       break;
 
     case 'create-offer-for':
-      // We are being asked to create an offer for a new peer
-      console.log(`[mesh] create-offer-for ${msg.targetId} via broker ${msg.brokerId}`);
-      createBrokeredOffer(msg.targetId, msg.brokerId, entry);
+      console.log(`[mesh] create-offer-for ${msg.targetStableId} via broker ${msg.brokerId}`);
+      // Guard: don't create offer for ourselves
+      if (msg.targetStableId === state.localPeerId) {
+        console.warn('[mesh] Ignoring create-offer-for targeting ourselves');
+        return;
+      }
+      createBrokeredOffer(msg.targetStableId, msg.brokerId, entry);
       break;
 
     case 'broker-offer':
-      // Are we the target or just a relay?
-      if (msg.targetId === state.localPeerId) {
-        console.log(`[mesh] broker-offer for us from ${msg.fromId}`);
+      if (msg.targetStableId === state.localPeerId) {
+        // This offer is for us
+        console.log(`[mesh] broker-offer for us from ${msg.fromStableId}`);
         handleBrokeredOffer(entry, msg);
       } else {
-        console.log(`[mesh] Forwarding broker-offer to ${msg.targetId}`);
-        forwardBrokerMessage(entry, msg);
-      }
-      break;
-
-    case 'broker-answer':
-      if (msg.targetId === state.localPeerId) {
-        console.log(`[mesh] broker-answer for us from ${msg.fromId}`);
-        handleBrokeredAnswer(msg);
-      } else {
-        console.log(`[mesh] Forwarding broker-answer to ${msg.targetId}`);
-        forwardBrokerMessage(entry, msg);
-      }
-      break;
-
-    case 'broker-ice':
-      if (msg.forId === state.localPeerId) {
-        console.log(`[mesh] broker-ice for us from ${msg.fromId}`);
-        handleBrokeredIce(msg);
-      } else {
-        console.log(`[mesh] Forwarding broker-ice to ${msg.forId}`);
-        const fwdTarget = state.peers.find(pe => pe.id === msg.forId);
-        if (fwdTarget?.dc?.readyState === 'open') {
-          fwdTarget.dc.send(JSON.stringify(msg));
+        // Forward to the target peer
+        console.log(`[mesh] Forwarding broker-offer to stableId ${msg.targetStableId}`);
+        const offerTarget = state.peers.find(pe => pe.stableId === msg.targetStableId);
+        if (offerTarget?.dc?.readyState === 'open') {
+          offerTarget.dc.send(JSON.stringify(msg));
+          console.log(`[mesh] Forwarded broker-offer to ${msg.targetStableId}`);
+        } else {
+          console.warn(`[mesh] Cannot forward broker-offer — no DC for ${msg.targetStableId}`);
         }
       }
       break;
 
+    case 'broker-answer':
+      if (msg.targetStableId === state.localPeerId) {
+        console.log(`[mesh] broker-answer for us from ${msg.fromStableId}`);
+        handleBrokeredAnswer(msg);
+      } else {
+        console.log(`[mesh] Forwarding broker-answer to stableId ${msg.targetStableId}`);
+        const answerTarget = state.peers.find(pe => pe.stableId === msg.targetStableId);
+        if (answerTarget?.dc?.readyState === 'open') {
+          answerTarget.dc.send(JSON.stringify(msg));
+          console.log(`[mesh] Forwarded broker-answer to ${msg.targetStableId}`);
+        } else {
+          console.warn(`[mesh] Cannot forward broker-answer — no DC for ${msg.targetStableId}`);
+        }
+      }
+      break;
+
+    case 'broker-ice':
+      if (msg.targetStableId === state.localPeerId) {
+        handleBrokeredIce(msg);
+      } else {
+        const iceTarget = state.peers.find(pe => pe.stableId === msg.targetStableId);
+        if (iceTarget?.dc?.readyState === 'open') {
+          iceTarget.dc.send(JSON.stringify(msg));
+        }
+      }
+      break;
+
+    case 'introduce-peers':
+      console.log(`[mesh] received peer list — ${msg.peers.length} peer(s) to connect`);
+      msg.peers.forEach(peerInfo => {
+        // Guard: don't introduce ourselves
+        if (peerInfo.stableId === state.localPeerId) return;
+        // Guard: don't duplicate existing connections
+        if (state.peers.find(pe => pe.stableId === peerInfo.stableId)) return;
+        console.log(`[mesh] Will connect to introduced peer ${peerInfo.stableId}`);
+        // The broker will send us their offer via create-offer-for → broker-offer flow
+        // We just pre-note we expect this peer
+      });
+      break;
+
     case 'peer-left':
-      console.log(`[mesh] peer-left — ${msg.peerId}`);
-      removePeer(msg.peerId);
+      console.log(`[mesh] peer-left — stableId: ${msg.stableId}`);
+      // Remove by stableId since that is what we reliably track
+      const leftEntry = state.peers.find(pe => pe.stableId === msg.stableId);
+      if (leftEntry) removePeer(leftEntry.id);
       addChatMessage('system', `${msg.name || 'A peer'} left`);
       break;
 
@@ -1053,9 +1107,8 @@ async function initiateCall(isAddPeer = false) {
   lockSettingsDuringCall();
   await startLocalMedia();
 
-  const peerId = uuid();
+  const peerId = uuid(); // this is the CONNECTION id, not our identity
   const roomId = peerId.slice(0, 10);
-  if (!state.localPeerId) state.localPeerId = peerId;
   
   const entry = createPeer(peerId);
   entry.roomId = roomId;
@@ -1072,7 +1125,7 @@ async function initiateCall(isAddPeer = false) {
   await waitForICE(entry.pc);
 
   const finalSDP = entry.pc.localDescription;
-  const offerPayload = { type: 'offer', sdp: finalSDP, peerId };
+  const offerPayload = { type: 'offer', sdp: finalSDP, peerId, fromId: state.localPeerId };
 
   // Build the short room link (no SDP in URL)
   const link = `${location.origin}${location.pathname}#room:${roomId}`;
@@ -1113,8 +1166,6 @@ async function joinCall(offerData, roomId) {
   showCallScreen();
   hideModal('signalingModal');
 
-  const newLocalId = uuid();
-  if (!state.localPeerId) state.localPeerId = newLocalId;
   const entry = createPeer(offerData.peerId || uuid());
   entry.roomId = roomId;
 
@@ -1128,7 +1179,7 @@ async function joinCall(offerData, roomId) {
   await waitForICE(entry.pc);
 
   const finalSDP = entry.pc.localDescription;
-  const answerPayload = { type: 'answer', sdp: finalSDP, peerId: entry.id };
+  const answerPayload = { type: 'answer', sdp: finalSDP, peerId: entry.id, fromId: state.localPeerId };
 
   // Publish answer automatically — no manual step needed
   try {
@@ -1301,35 +1352,42 @@ function showSignalingModal(mode, ctx) {
 
 // Called by A when a new peer (C) connects — introduce C to all existing peers
 function brokerIntroductions(newEntry) {
-  const existingPeers = state.peers.filter(pe => pe.id !== newEntry.id && pe.status === 'connected');
+  const existingPeers = state.peers.filter(pe =>
+    pe.id !== newEntry.id &&
+    pe.status === 'connected' &&
+    pe.stableId // only peers whose identity we know
+  );
+
   if (existingPeers.length === 0) {
     console.log('[mesh] No existing peers to introduce');
     return;
   }
-  console.log(`[mesh] Brokering introductions — ${existingPeers.length} existing peer(s)`);
+  console.log(`[mesh] Brokering — new peer stableId: ${newEntry.stableId}, existing: ${existingPeers.length}`);
 
-  // Tell C about all existing peers
+  // Tell new peer about everyone already here (using stable IDs)
   const peerList = existingPeers.map(pe => ({
-    peerId: pe.id,
-    name:   pe.info?.name || 'Unknown',
+    stableId: pe.stableId,
+    name:     pe.info?.name || 'Unknown',
   }));
+
   if (newEntry.dc?.readyState === 'open') {
     newEntry.dc.send(JSON.stringify({
-      type:  'introduce-peers',
-      peers: peerList,
+      type:        'introduce-peers',
+      peers:       peerList,
+      brokerId:    state.localPeerId, // so they know who to route through
     }));
-    console.log(`[mesh] Sent peer list to ${newEntry.id}:`, peerList);
+    console.log(`[mesh] Sent peer list to ${newEntry.stableId}`);
   }
 
   // Tell each existing peer to create an offer for the new peer
   existingPeers.forEach(pe => {
     if (pe.dc?.readyState === 'open') {
       pe.dc.send(JSON.stringify({
-        type:       'create-offer-for',
-        targetId:   newEntry.id,
-        brokerId:   state.localPeerId,
+        type:           'create-offer-for',
+        targetStableId: newEntry.stableId,  // who to connect to
+        brokerId:       state.localPeerId,  // route back through me
       }));
-      console.log(`[mesh] Asked ${pe.id} to create offer for ${newEntry.id}`);
+      console.log(`[mesh] Asked ${pe.stableId} to create offer for ${newEntry.stableId}`);
     }
   });
 }
@@ -1346,13 +1404,19 @@ function handleIntroduction(peerInfo) {
 }
 
 // Existing peer (B) received instruction to create offer for new peer (C)
-async function createBrokeredOffer(targetId, brokerId, brokerEntry) {
-  console.log(`[mesh] Creating brokered offer for ${targetId}`);
-  let entry = state.peers.find(pe => pe.id === targetId);
-  if (!entry) {
-    entry = createPeer(targetId);
-    entry.isBrokered = true;
+async function createBrokeredOffer(targetStableId, brokerId, brokerEntry) {
+  console.log(`[mesh] Creating brokered offer for stableId: ${targetStableId}`);
+
+  // Check we don't already have a connection to this stable peer
+  if (state.peers.find(pe => pe.stableId === targetStableId)) {
+    console.log(`[mesh] Already have connection to ${targetStableId} — skipping`);
+    return;
   }
+
+  const connId = uuid();
+  const entry = createPeer(connId);
+  entry.stableId = targetStableId;
+  entry.isBrokered = true;
 
   entry.dc = entry.pc.createDataChannel('nexus', { ordered: true });
   setupDataChannel(entry);
@@ -1362,39 +1426,42 @@ async function createBrokeredOffer(targetId, brokerId, brokerEntry) {
   await waitForICE(entry.pc);
 
   const finalSDP = entry.pc.localDescription;
-  console.log(`[mesh] Brokered offer ready — sending via broker ${brokerId}`);
 
-  // Send offer back through broker (A) who will forward to C
+  entry.pc.onicecandidate = e => {
+    if (!e.candidate || !brokerEntry.dc || brokerEntry.dc.readyState !== 'open') return;
+    brokerEntry.dc.send(JSON.stringify({
+      type:            'broker-ice',
+      fromStableId:    state.localPeerId,
+      targetStableId:  targetStableId,
+      candidate:       e.candidate,
+    }));
+  };
+
   if (brokerEntry.dc?.readyState === 'open') {
     brokerEntry.dc.send(JSON.stringify({
-      type:     'broker-offer',
-      fromId:   state.localPeerId,
-      targetId: targetId,
-      sdp:      finalSDP,
+      type:            'broker-offer',
+      fromStableId:    state.localPeerId,
+      targetStableId:  targetStableId,
+      sdp:             finalSDP,
     }));
+    console.log(`[mesh] Sent broker-offer via ${brokerEntry.stableId} for ${targetStableId}`);
   }
-
-  // Listen for brokered ICE from this peer
-  entry.pc.onicecandidate = e => {
-    if (!e.candidate) return;
-    if (brokerEntry.dc?.readyState === 'open') {
-      brokerEntry.dc.send(JSON.stringify({
-        type:     'broker-ice',
-        fromId:   state.localPeerId,
-        forId:    targetId,
-        candidate: e.candidate,
-      }));
-    }
-  };
 }
 
 // C receives a brokered offer from B (forwarded by A)
 async function handleBrokeredOffer(brokerEntry, msg) {
-  let entry = state.peers.find(pe => pe.id === msg.fromId);
-  if (!entry) {
-    entry = createPeer(msg.fromId);
-    entry.isBrokered = true;
+  console.log(`[mesh] Handling brokered offer from ${msg.fromStableId}`);
+
+  // Check we don't already have this connection
+  if (state.peers.find(pe => pe.stableId === msg.fromStableId)) {
+    console.log(`[mesh] Already connected to ${msg.fromStableId} — ignoring duplicate offer`);
+    return;
   }
+
+  const connId = uuid();
+  const entry = createPeer(connId);
+  entry.stableId = msg.fromStableId;
+  entry.isBrokered = true;
 
   await entry.pc.setRemoteDescription(new RTCSessionDescription({
     type: 'offer', sdp: msg.sdp.sdp || msg.sdp,
@@ -1405,56 +1472,55 @@ async function handleBrokeredOffer(brokerEntry, msg) {
   await waitForICE(entry.pc);
 
   const finalSDP = entry.pc.localDescription;
-  console.log(`[mesh] Brokered answer ready — sending via broker`);
 
-  // Send answer back through broker
+  entry.pc.onicecandidate = e => {
+    if (!e.candidate || !brokerEntry.dc || brokerEntry.dc.readyState !== 'open') return;
+    brokerEntry.dc.send(JSON.stringify({
+      type:           'broker-ice',
+      fromStableId:   state.localPeerId,
+      targetStableId: msg.fromStableId,
+      candidate:      e.candidate,
+    }));
+  };
+
   if (brokerEntry.dc?.readyState === 'open') {
     brokerEntry.dc.send(JSON.stringify({
-      type:     'broker-answer',
-      fromId:   state.localPeerId,
-      targetId: msg.fromId,
-      sdp:      finalSDP,
+      type:           'broker-answer',
+      fromStableId:   state.localPeerId,
+      targetStableId: msg.fromStableId,
+      sdp:            finalSDP,
     }));
+    console.log(`[mesh] Sent broker-answer via ${brokerEntry.stableId}`);
   }
-
-  // Forward ICE candidates through broker
-  entry.pc.onicecandidate = e => {
-    if (!e.candidate) return;
-    if (brokerEntry.dc?.readyState === 'open') {
-      brokerEntry.dc.send(JSON.stringify({
-        type:      'broker-ice',
-        fromId:    state.localPeerId,
-        forId:     msg.fromId,
-        candidate: e.candidate,
-      }));
-    }
-  };
 }
 
 // B receives the answer from C (forwarded by A) — finalize B↔C connection
 async function handleBrokeredAnswer(msg) {
-  const entry = state.peers.find(pe => pe.id === msg.fromId);
+  const entry = state.peers.find(pe => pe.stableId === msg.fromStableId);
   if (!entry) {
-    console.warn(`[mesh] broker-answer — no entry found for ${msg.fromId}`);
+    console.warn(`[mesh] broker-answer — no entry for stableId ${msg.fromStableId}`);
     return;
   }
   await entry.pc.setRemoteDescription(new RTCSessionDescription({
     type: 'answer', sdp: msg.sdp.sdp || msg.sdp,
   }));
-  console.log(`[mesh] ✓ Brokered connection finalized with ${msg.fromId}`);
+  console.log(`[mesh] ✓ Brokered connection finalized with ${msg.fromStableId}`);
 }
 
 // Apply a relayed ICE candidate
 async function handleBrokeredIce(msg) {
-  const entry = state.peers.find(pe => pe.id === msg.forId);
-  if (!entry) return;
+  const entry = state.peers.find(pe => pe.stableId === msg.targetStableId);
+  if (!entry) {
+    console.warn(`[mesh] broker-ice — no entry for stableId ${msg.targetStableId}`);
+    return;
+  }
   try {
     await entry.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-    console.log(`[mesh] ICE candidate applied for ${msg.forId}`);
   } catch (e) {
     console.warn(`[mesh] ICE candidate failed:`, e);
   }
 }
+
 
 // A needs to forward broker messages between B and C
 function forwardBrokerMessage(fromEntry, msg) {
@@ -1624,9 +1690,9 @@ DOM.btnSaveSettings.addEventListener('click', () => {
 function endCall() {
   // Notify all peers before closing
   const leaveMsg = JSON.stringify({
-    type:   'peer-left',
-    peerId: state.localPeerId,
-    name:   state.profile.name,
+    type:     'peer-left',
+    stableId: state.localPeerId,
+    name:     state.profile.name,
   });
   state.peers.forEach(pe => {
     if (pe.dc?.readyState === 'open') pe.dc.send(leaveMsg);

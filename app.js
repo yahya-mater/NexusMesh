@@ -786,25 +786,6 @@ function ntfyListen(roomIdOrTopic, leg, onMessage, onError) {
   return { close: cleanup };
 }
 
-async function initiateCall(isAddPeer = false) {
-  if (!isAddPeer) {
-    showCallScreen();
-    showSignalingModalLoading();
-    lockSettingsDuringCall();
-    await startLocalMedia();
-  }
-
-  const link = await createOrRefreshRoom();
-  if (!link) return;
-
-  showSignalingModal('offer-ntfy', {
-    link,
-    roomId: state.room.id,
-  });
-}
-
-
-
 function copyToClipboard(text) {
   navigator.clipboard.writeText(text)
     .then(() => toast('Copied to clipboard!', 'success'))
@@ -1028,40 +1009,42 @@ function createPeer(id) {
   const entry = {
     id,
     pc,
-    dc: null,
+    dc:           null,
     remoteStream,
-    info: null,
-    statusEl: null,
-    videoEl: null,
-    tileEl: null,
-    status: 'new',
+    info:         null,
+    statusEl:     null,
+    videoEl:      null,
+    tileEl:       null,
+    status:       'new',
+    tileAttached: false,  // tile only added when handshake is confirmed
   };
 
-  // Add local tracks
   if (state.localStream) {
     state.localStream.getTracks().forEach(t => pc.addTrack(t, state.localStream));
   }
 
-  // Remote tracks
   pc.ontrack = e => {
     e.streams[0]?.getTracks().forEach(t => remoteStream.addTrack(t));
     if (entry.videoEl) entry.videoEl.srcObject = remoteStream;
   };
 
-  // ICE logging
-  pc.onicecandidate = () => {};  // candidates gathered inline during createOffer
+  pc.onicecandidate = () => {};
 
-  // Connection state
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
     console.log(`[${id}] connectionState →`, s);
     entry.status = s;
+
+    // Attach tile on first sign of life if not already attached
+    if ((s === 'connecting' || s === 'connected') && !entry.tileAttached) {
+      attachPeerTile(entry);
+    }
+
     updatePeerTileStatus(entry);
     updateGlobalStatus();
 
     if (s === 'failed' || s === 'closed' || s === 'disconnected') {
-      console.log(`[mesh] Peer ${id} (stable: ${entry.stableId}) — state: ${s}, scheduling cleanup`);
-      // Give 8 seconds for reconnection before removing tile
+      console.log(`[mesh] Peer ${id} — state: ${s}, scheduling cleanup`);
       setTimeout(() => {
         if (entry.status === 'failed' || entry.status === 'closed' || entry.status === 'disconnected') {
           console.log(`[mesh] Removing unrecovered peer ${id}`);
@@ -1073,15 +1056,23 @@ function createPeer(id) {
     }
   };
 
-  // Data channel (remote side)
   pc.ondatachannel = e => {
     entry.dc = e.channel;
     setupDataChannel(entry);
   };
 
   state.peers.push(entry);
-  addRemoteTile(entry);
+  // NO tile added here — tile added only when connection is real
   return entry;
+}
+
+// Called only when we know a real peer is on the other end
+function attachPeerTile(entry) {
+  if (entry.tileAttached) return;
+  entry.tileAttached = true;
+  console.log(`[tile] Attaching tile for peer ${entry.id}`);
+  addRemoteTile(entry);
+  refreshGridClass();
 }
 
 function setupDataChannel(entry) {
@@ -1349,8 +1340,6 @@ function addRemoteTile(entry) {
   entry.videoEl = video;
   entry.statusEl = statusBadge;
   entry.tileEl = tile;
-
-  refreshGridClass();
 }
 
 function refreshGridClass() {
@@ -1526,56 +1515,25 @@ function checkProfileBeforeCall(onProceed) {
  *  4. Encode offer → URL hash / textarea
  */
 async function initiateCall(isAddPeer = false) {
-  showCallScreen();
-  showSignalingModalLoading();
-  lockSettingsDuringCall();
-  await startLocalMedia();
-
-  const peerId = uuid(); // this is the CONNECTION id, not our identity
-  const roomId = peerId.slice(0, 10);
-  
-  const entry = createPeer(peerId);
-  entry.roomId = roomId;
-
-  // Initiator opens the data channel
-  entry.dc = entry.pc.createDataChannel('nexus', { ordered: true });
-  setupDataChannel(entry);
-
-  // Create offer
-  const offer = await entry.pc.createOffer();
-  await entry.pc.setLocalDescription(offer);
-
-  // Wait for ICE gathering to complete
-  await waitForICE(entry.pc);
-
-  const finalSDP = entry.pc.localDescription;
-  const offerPayload = { type: 'offer', sdp: finalSDP, peerId, fromId: state.localPeerId };
-
-  // Build the short room link (no SDP in URL)
-  const link = `${location.origin}${location.pathname}#room:${roomId}`;
-
-  // Show modal with link immediately
-  showSignalingModal('offer-ntfy', { entry, link, roomId, offerPayload });
-
-  // Publish offer to ntfy in background
-  try {
-    await ntfyPublish(roomId, 'offer', offerPayload);
-    toast('Offer published — waiting for peer…', 'success');
-  } catch (e) {
-    toast('ntfy publish failed — use manual code below', 'error');
-    console.error(e);
+  if (!isAddPeer) {
+    showCallScreen();
+    lockSettingsDuringCall();
+    // Only show loading/request permissions if we don't have a stream yet
+    if (!state.localStream) {
+      showSignalingModalLoading();
+      await startLocalMedia();
+    }
   }
 
-  // Listen for answer coming back
-  const listener = ntfyListen(roomId, 'answer', async (answerData) => {
-    entry._answerListener = null;
-    await finalizeCall(entry, answerData);
-  }, (err) => {
-    console.error('Answer listener error:', err);
-    toast('Timed out waiting for answer — ask peer to retry', 'error');
+  const link = await createOrRefreshRoom();
+  if (!link) return;
+
+  showSignalingModal('offer-ntfy', {
+    link,
+    roomId: state.room.id,
   });
-  entry._answerListener = listener;
 }
+
 
 /**
  * JOINER FLOW:

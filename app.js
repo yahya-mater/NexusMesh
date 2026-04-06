@@ -120,6 +120,13 @@ const DOM = {
 };
 
 /* ═══════════════════════════════════════════════════ UTILS */
+
+// Shorten a stableId to 8 chars for use in ntfy topic names
+// ntfy has a 64-char topic limit — full UUIDs in combined topics exceed this
+function shortId(stableId) {
+  return stableId.replace(/-/g, '').slice(0, 8);
+}
+
 function uuid() {
   return crypto.randomUUID?.() ||
     ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
@@ -321,10 +328,12 @@ async function processRoomAnswer(data) {
 
   state.room.seenAnswers.add(joinerStableId);
   console.log(`[room] ✓ New joiner answer from ${joinerStableId} — creating connection`);
+  toast('Peer joining — connecting…', '');
 
-  // Create a fresh peer connection for this specific joiner
   const entry = createPeer(uuid());
   entry.stableId = joinerStableId;
+  // Attach tile immediately so A can see someone is connecting
+  attachPeerTile(entry);
   const pc = entry.pc;
   if (state.localStream) {
     state.localStream.getTracks().forEach(t => pc.addTrack(t, state.localStream));
@@ -344,7 +353,7 @@ async function processRoomAnswer(data) {
   const finalSDP = pc.localDescription;
 
   // Send direct offer to this specific joiner
-  const directTopic = `${NTFY_PREFIX}-direct-${joinerStableId}`;
+  const directTopic = `${NTFY_PREFIX}-d-${shortId(joinerStableId)}`;
   console.log(`[room] Sending direct offer to ${joinerStableId} via ${directTopic}`);
 
   try {
@@ -372,10 +381,10 @@ async function processRoomAnswer(data) {
 }
 
 function listenForDirectAnswer(entry, joinerStableId) {
-  const myDirectTopic = `${NTFY_PREFIX}-direct-${state.localPeerId}-from-${joinerStableId}`;
-  console.log(`[room] Listening for direct answer on topic: ${myDirectTopic}`);
+  const myDirectTopic = `${NTFY_PREFIX}-da-${shortId(state.localPeerId)}-${shortId(joinerStableId)}`;
+  console.log(`[room] Listening for direct answer on topic: ${myDirectTopic} (len:${myDirectTopic.length})`);
 
-  const listener = ntfyListen(myDirectTopic, '', data => {
+  const listener = ntfyListen(myDirectTopic, null, data => {
     if (data.type !== 'direct-answer' || data.fromId !== joinerStableId) return;
     console.log(`[room] ✓ Got direct answer from ${joinerStableId}`);
     entry.pc.setRemoteDescription(new RTCSessionDescription({
@@ -474,10 +483,10 @@ async function joinRoom(roomId) {
   }
 
   // Listen for direct offer from host
-  const directTopic = `${NTFY_PREFIX}-direct-${state.localPeerId}`;
-  console.log(`[room] Listening for direct offer on: ${directTopic}`);
+  const directTopic = `${NTFY_PREFIX}-d-${shortId(state.localPeerId)}`;
+  console.log(`[room] Listening for direct offer on: ${directTopic} (len:${directTopic.length})`);
 
-  const listener = ntfyListen(directTopic, '', async data => {
+  const listener = ntfyListen(directTopic, null, async data => {
     if (data.type !== 'direct-offer') return;
     console.log(`[room] ✓ Got direct offer from host ${data.fromId}`);
 
@@ -499,7 +508,8 @@ async function joinRoom(roomId) {
     const finalSDP = entry.pc.localDescription;
 
     // Send answer back to host
-    const replyTopic = `${NTFY_PREFIX}-direct-${data.fromId}-from-${state.localPeerId}`;
+    const replyTopic = `${NTFY_PREFIX}-da-${shortId(data.fromId)}-${shortId(state.localPeerId)}`;
+    console.log(`[room] Posting direct answer to: ${replyTopic} (len:${replyTopic.length})`);
     await fetch(`${NTFY_BASE}/${replyTopic}`, {
       method: 'POST',
       headers: {
@@ -584,7 +594,7 @@ async function ntfyPublish(roomId, leg, payload) {
 
 function ntfyListen(roomIdOrTopic, leg, onMessage, onError) {
   // If leg is empty string, treat first arg as a full topic name
-  const topic   = leg === '' ? roomIdOrTopic : ntfyTopic(roomIdOrTopic, leg);
+  const topic = (!leg) ? roomIdOrTopic : ntfyTopic(roomIdOrTopic, leg);
   const sseUrl  = `${NTFY_BASE}/${topic}/sse`;
   const pollUrl = `${NTFY_BASE}/${topic}/json?poll=1&since=all`;
 

@@ -581,7 +581,7 @@ function ntfyListen(roomIdOrTopic, leg, onMessage, onError) {
   const sseUrl  = `${NTFY_BASE}/${topic}/sse`;
   const pollUrl = `${NTFY_BASE}/${topic}/json?poll=1&since=all`;
 
-  console.log(`[ntfy:listen] Starting listener — leg: ${leg}, roomId: ${roomId}`);
+  console.log(`[ntfy:listen] Starting listener — leg: ${leg}, roomId: ${roomIdOrTopic}`);
   console.log(`[ntfy:listen] SSE  URL: ${sseUrl}`);
   console.log(`[ntfy:listen] Poll URL: ${pollUrl}`);
 

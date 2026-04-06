@@ -23,7 +23,9 @@ const MAX_AVATAR_PX = 72;   // px — keep Base64 small
 const LINK_MAX_HASH = 4096; // chars before we warn about truncation
 const NTFY_BASE = 'https://ntfy-bqw1.onrender.com';//'https://ntfy.sh';
 const NTFY_PREFIX = 'nexusmesh';
-const NTFY_TTL = 300; // seconds — messages expire after 5 min
+const NTFY_TTL        = 600;  // seconds — 10 min room offer lifetime
+const NTFY_TTL_MS     = NTFY_TTL * 1000;
+const ROOM_POLL_INTERVAL = 5000; // check for new joiners every 5 seconds
 
 /* ═══════════════════════════════════════════════════ STATE */
 
@@ -36,7 +38,15 @@ const state = {
   chatOpen: false,
   unreadCount: 0,
   profile: loadProfile(),
-  localPeerId: uuid(), // stable for the lifetime of this tab — never reassigned
+  localPeerId: uuid(),
+  room: {
+    id:          null,   // current roomId
+    link:        null,   // shareable URL
+    expiresAt:   null,   // Date.now() + TTL_MS
+    answerPoller: null,  // interval handle
+    seenAnswers: new Set(), // stableIds we already processed
+    pc:          null,   // the room offer RTCPeerConnection (reused for each joiner)
+  },
 };
 
 /*
@@ -150,6 +160,380 @@ function toast(msg, type = '') {
   setTimeout(() => el.remove(), 3200);
 }
 
+/* ═══════════════════════════════════════════════════ ROOM MANAGEMENT */
+
+async function createOrRefreshRoom() {
+  // If room still valid return existing link
+  if (state.room.id && state.room.expiresAt && Date.now() < state.room.expiresAt) {
+    console.log(`[room] Still valid — expires in ${Math.round((state.room.expiresAt - Date.now()) / 1000)}s`);
+    return state.room.link;
+  }
+
+  console.log('[room] Creating/refreshing room offer…');
+
+  // Stop existing answer poller
+  if (state.room.answerPoller) {
+    clearInterval(state.room.answerPoller);
+    state.room.answerPoller = null;
+  }
+
+  // Generate new roomId or reuse existing
+  const roomId = state.room.id || uuid().slice(0, 12);
+  state.room.id = roomId;
+  state.room.seenAnswers = new Set();
+
+  // Create a generic room offer — this is not tied to a specific remote peer
+  // Each joiner will use it to generate their own answer
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  state.room.pc = pc;
+
+  // Add local tracks so the offer includes media
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(t => pc.addTrack(t, state.localStream));
+  }
+
+  // Need at least one data channel for the offer to be valid
+  pc.createDataChannel('room-probe');
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForICE(pc);
+
+  const finalSDP = pc.localDescription;
+  const offerPayload = {
+    type:     'room-offer',
+    sdp:      finalSDP,
+    roomId,
+    hostId:   state.localPeerId,
+  };
+
+  // Publish to ntfy
+  const topic = `${NTFY_PREFIX}-room-${roomId}`;
+  console.log(`[room] Publishing offer to topic: ${topic}`);
+  try {
+    const res = await fetch(`${NTFY_BASE}/${topic}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain',
+        'X-TTL':        String(NTFY_TTL),
+        'X-Title':      'NexusMesh Room',
+      },
+      body: encode(offerPayload),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    console.log('[room] ✓ Room offer published');
+  } catch (e) {
+    console.error('[room] ✗ Failed to publish room offer:', e);
+    toast('Failed to publish room — check your connection', 'error');
+    return null;
+  }
+
+  const link = `${location.origin}${location.pathname}#room:${roomId}`;
+  state.room.link      = link;
+  state.room.expiresAt = Date.now() + NTFY_TTL_MS;
+
+  // Start polling for answers from joiners
+  startAnswerPoller(roomId);
+
+  console.log(`[room] ✓ Room ready — link: ${link}`);
+  return link;
+}
+
+function startAnswerPoller(roomId) {
+  if (state.room.answerPoller) clearInterval(state.room.answerPoller);
+
+  const answerTopic = `${NTFY_PREFIX}-room-${roomId}-answers`;
+  const pollUrl     = `${NTFY_BASE}/${answerTopic}/json?poll=1&since=all`;
+
+  console.log(`[room] Starting answer poller — topic: ${answerTopic}`);
+
+  // Also open SSE for instant notification
+  const sseUrl = `${NTFY_BASE}/${answerTopic}/sse`;
+  const es = new EventSource(sseUrl);
+  es.onopen  = () => console.log('[room:sse] ✓ Answer SSE open');
+  es.onmessage = e => {
+    try {
+      const envelope = JSON.parse(e.data);
+      if (envelope.event === 'open' || !envelope.message) return;
+      let clean = envelope.message;
+      try { clean = decodeURIComponent(clean); } catch {}
+      const data = decode(clean);
+      if (data?.type === 'room-answer') processRoomAnswer(data);
+    } catch {}
+  };
+  es.onerror = () => {
+    console.warn('[room:sse] SSE error — relying on poll fallback');
+    es.close();
+  };
+
+  // Polling fallback
+  async function poll() {
+    if (!state.room.id) return;
+    try {
+      const res = await fetch(pollUrl, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) return;
+      const text = await res.text();
+      if (!text.trim()) return;
+      const lines = text.trim().split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const envelope = JSON.parse(line);
+          if (envelope.event === 'open' || !envelope.message) continue;
+          let clean = envelope.message;
+          try { clean = decodeURIComponent(clean); } catch {}
+          const data = decode(clean);
+          if (data?.type === 'room-answer') processRoomAnswer(data);
+        } catch { continue; }
+      }
+    } catch { /* network blip */ }
+  }
+
+  poll(); // immediate
+  state.room.answerPoller = setInterval(poll, ROOM_POLL_INTERVAL);
+  // Store SSE handle for cleanup
+  state.room.answerSSE = es;
+}
+
+async function processRoomAnswer(data) {
+  const { joinerStableId, sdp, roomId } = data;
+
+  if (roomId !== state.room.id) {
+    console.log(`[room] Answer for old room ${roomId} — ignoring`);
+    return;
+  }
+  if (state.room.seenAnswers.has(joinerStableId)) {
+    console.log(`[room] Already processed answer from ${joinerStableId}`);
+    return;
+  }
+  if (joinerStableId === state.localPeerId) {
+    console.log(`[room] Ignoring own answer`);
+    return;
+  }
+  // Check if already connected
+  if (state.peers.find(pe => pe.stableId === joinerStableId)) {
+    console.log(`[room] Already connected to ${joinerStableId}`);
+    return;
+  }
+
+  state.room.seenAnswers.add(joinerStableId);
+  console.log(`[room] ✓ New joiner answer from ${joinerStableId} — creating connection`);
+
+  // Create a fresh peer connection for this specific joiner
+  const entry = createPeer(uuid());
+  entry.stableId = joinerStableId;
+
+  // Re-create offer/answer with a dedicated PC for this peer
+  const pc = entry.pc;
+
+  // Add local tracks
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(t => pc.addTrack(t, state.localStream));
+  }
+
+  // The joiner already created their answer based on the room offer SDP
+  // We need to create a fresh direct offer/answer pair for real media
+  // Post a direct offer back to the joiner via ntfy
+  const dc = pc.createDataChannel('nexus', { ordered: true });
+  entry.dc = dc;
+  setupDataChannel(entry);
+
+  const directOffer = await pc.createOffer();
+  await pc.setLocalDescription(directOffer);
+  await waitForICE(pc);
+
+  const finalSDP = pc.localDescription;
+
+  // Send direct offer to this specific joiner
+  const directTopic = `${NTFY_PREFIX}-direct-${joinerStableId}`;
+  console.log(`[room] Sending direct offer to ${joinerStableId} via ${directTopic}`);
+
+  try {
+    await fetch(`${NTFY_BASE}/${directTopic}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain',
+        'X-TTL':        '120',
+        'X-Title':      'NexusMesh Direct',
+      },
+      body: encode({
+        type:       'direct-offer',
+        sdp:        finalSDP,
+        fromId:     state.localPeerId,
+        roomId:     state.room.id,
+      }),
+    });
+    console.log(`[room] ✓ Direct offer sent to ${joinerStableId}`);
+  } catch (e) {
+    console.error('[room] ✗ Failed to send direct offer:', e);
+  }
+
+  // Listen for direct answer from this joiner
+  listenForDirectAnswer(entry, joinerStableId);
+}
+
+function listenForDirectAnswer(entry, joinerStableId) {
+  const myDirectTopic = `${NTFY_PREFIX}-direct-${state.localPeerId}-from-${joinerStableId}`;
+  console.log(`[room] Listening for direct answer on topic: ${myDirectTopic}`);
+
+  const listener = ntfyListen(myDirectTopic, '', data => {
+    if (data.type !== 'direct-answer' || data.fromId !== joinerStableId) return;
+    console.log(`[room] ✓ Got direct answer from ${joinerStableId}`);
+    entry.pc.setRemoteDescription(new RTCSessionDescription({
+      type: 'answer', sdp: data.sdp.sdp || data.sdp,
+    })).then(() => {
+      console.log(`[room] ✓ Direct connection established with ${joinerStableId}`);
+      toast(`${entry.info?.name || 'A peer'} joined`, 'success');
+    }).catch(e => console.error('[room] setRemoteDescription failed:', e));
+  }, err => {
+    console.error('[room] Direct answer listener error:', err);
+  });
+
+  // Auto-cancel after 2 min
+  setTimeout(() => listener.close(), 120000);
+}
+
+// Called on the joiner side when they open a room link
+async function joinRoom(roomId) {
+  console.log(`[room] Joining room ${roomId}`);
+
+  // Fetch room offer from ntfy
+  const roomTopic  = `${NTFY_PREFIX}-room-${roomId}`;
+  const pollUrl    = `${NTFY_BASE}/${roomTopic}/json?poll=1&since=all`;
+
+  showJoinSpinner(roomId);
+
+  let roomOffer = null;
+  let attempts  = 0;
+  while (!roomOffer && attempts < 10) {
+    attempts++;
+    console.log(`[room] Fetching room offer attempt ${attempts}…`);
+    try {
+      const res  = await fetch(pollUrl, { signal: AbortSignal.timeout(8000) });
+      const text = await res.text();
+      const lines = text.trim().split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const envelope = JSON.parse(line);
+          if (!envelope.message) continue;
+          let clean = envelope.message;
+          try { clean = decodeURIComponent(clean); } catch {}
+          const data = decode(clean);
+          if (data?.type === 'room-offer' && data.roomId === roomId) {
+            roomOffer = data;
+            break;
+          }
+        } catch { continue; }
+      }
+    } catch (e) {
+      console.warn(`[room] Fetch attempt ${attempts} failed:`, e);
+    }
+    if (!roomOffer) await new Promise(r => setTimeout(r, 2000));
+  }
+
+  if (!roomOffer) {
+    console.error('[room] Could not fetch room offer — expired or invalid');
+    toast('Room link expired or invalid', 'error');
+    hideModal('signalingModal');
+    showSplash();
+    return;
+  }
+
+  console.log(`[room] ✓ Got room offer from host ${roomOffer.hostId}`);
+  hideModal('signalingModal');
+  await startLocalMedia();
+  showCallScreen();
+  lockSettingsDuringCall();
+
+  // Post our answer token to the answers topic so the host knows we want to join
+  const answersTopic = `${NTFY_PREFIX}-room-${roomId}-answers`;
+  try {
+    await fetch(`${NTFY_BASE}/${answersTopic}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain',
+        'X-TTL':        '120',
+        'X-Title':      'NexusMesh Join',
+      },
+      body: encode({
+        type:            'room-answer',
+        joinerStableId:  state.localPeerId,
+        roomId,
+        // We don't send real SDP here — host will send us a direct offer
+      }),
+    });
+    console.log(`[room] ✓ Join request posted — waiting for direct offer from host`);
+  } catch (e) {
+    console.error('[room] Failed to post join request:', e);
+    toast('Failed to join room', 'error');
+    return;
+  }
+
+  // Listen for direct offer from host
+  const directTopic = `${NTFY_PREFIX}-direct-${state.localPeerId}`;
+  console.log(`[room] Listening for direct offer on: ${directTopic}`);
+
+  const listener = ntfyListen(directTopic, '', async data => {
+    if (data.type !== 'direct-offer') return;
+    console.log(`[room] ✓ Got direct offer from host ${data.fromId}`);
+
+    const entry = createPeer(uuid());
+    entry.stableId = data.fromId;
+
+    if (state.localStream) {
+      state.localStream.getTracks().forEach(t => entry.pc.addTrack(t, state.localStream));
+    }
+
+    await entry.pc.setRemoteDescription(new RTCSessionDescription({
+      type: 'offer', sdp: data.sdp.sdp || data.sdp,
+    }));
+
+    const answer = await entry.pc.createAnswer();
+    await entry.pc.setLocalDescription(answer);
+    await waitForICE(entry.pc);
+
+    const finalSDP = entry.pc.localDescription;
+
+    // Send answer back to host
+    const replyTopic = `${NTFY_PREFIX}-direct-${data.fromId}-from-${state.localPeerId}`;
+    await fetch(`${NTFY_BASE}/${replyTopic}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain',
+        'X-TTL':        '120',
+        'X-Title':      'NexusMesh Answer',
+      },
+      body: encode({
+        type:   'direct-answer',
+        sdp:    finalSDP,
+        fromId: state.localPeerId,
+        roomId,
+      }),
+    });
+
+    console.log(`[room] ✓ Direct answer sent to host — P2P handshake complete`);
+    listener.close();
+  }, err => {
+    console.error('[room] Direct offer listener error:', err);
+    toast('Connection timed out — try rejoining', 'error');
+  });
+}
+
+function stopRoom() {
+  if (state.room.answerPoller) {
+    clearInterval(state.room.answerPoller);
+    state.room.answerPoller = null;
+  }
+  if (state.room.answerSSE) {
+    state.room.answerSSE.close();
+    state.room.answerSSE = null;
+  }
+  state.room.id        = null;
+  state.room.link      = null;
+  state.room.expiresAt = null;
+  state.room.seenAnswers = new Set();
+  console.log('[room] Room stopped');
+}
+
 /* ═══════════════════════════════════════════════════ NTFY SIGNALING */
 function ntfyTopic(roomId, leg) {
   const topic = `${NTFY_PREFIX}-${leg}-${roomId}`;
@@ -191,204 +575,21 @@ async function ntfyPublish(roomId, leg, payload) {
   console.log(`[ntfy:publish] ✓ Offer published successfully to topic: ${topic}`);
 }
 
-function ntfyListen(roomId, leg, onMessage, onError) {
-  const topic = ntfyTopic(roomId, leg);
-  const sseUrl  = `${NTFY_BASE}/${topic}/sse`;
-  const pollUrl = `${NTFY_BASE}/${topic}/json?poll=1&since=all`;
-
-  console.log(`[ntfy:listen] Starting listener — leg: ${leg}, roomId: ${roomId}`);
-  console.log(`[ntfy:listen] SSE  URL: ${sseUrl}`);
-  console.log(`[ntfy:listen] Poll URL: ${pollUrl}`);
-
-  let closed         = false;
-  let es             = null;
-  let pollTimer      = null;
-  let pollAttempts   = 0;
-  let messageHandled = false;
-  const MAX_POLL     = 90;
-  const POLL_INTERVAL = 4000;
-
-  function handleMessage(raw) {
-    console.log(`[ntfy:listen] handleMessage called, already handled: ${messageHandled}, closed: ${closed}`);
-    if (messageHandled || closed) {
-      console.log(`[ntfy:listen] Skipping — already handled or closed`);
-      return;
-    }
-    console.log(`[ntfy:listen] Raw message received (first 120 chars): ${String(raw).slice(0, 120)}…`);
-    const data = decode(raw);
-    if (!data) {
-      console.warn(`[ntfy:listen] ✗ decode() returned null — message may be malformed or wrong encoding`);
-      return;
-    }
-    console.log(`[ntfy:listen] ✓ Decoded payload type: ${data.type}, peerId: ${data.peerId}`);
-    messageHandled = true;
-    cleanup();
-    onMessage(data);
+async function initiateCall(isAddPeer = false) {
+  if (!isAddPeer) {
+    showCallScreen();
+    showSignalingModalLoading();
+    lockSettingsDuringCall();
+    await startLocalMedia();
   }
 
-  function cleanup() {
-    console.log(`[ntfy:listen] cleanup() called — closing SSE and poll timer`);
-    closed = true;
-    if (es)        { es.close(); es = null; console.log(`[ntfy:listen] SSE closed`); }
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; console.log(`[ntfy:listen] Poll timer cleared`); }
-  }
+  const link = await createOrRefreshRoom();
+  if (!link) return;
 
-  // ── SSE
-  function trySSE() {
-    console.log(`[ntfy:listen:sse] Opening EventSource → ${sseUrl}`);
-    try {
-      es = new EventSource(sseUrl);
-
-      es.onopen = () => {
-        console.log(`[ntfy:listen:sse] ✓ Connection opened`);
-        // Immediately do a one-shot poll to catch messages published
-        // before we started listening (race condition between publish and subscribe)
-        console.log(`[ntfy:listen:sse] Running catch-up poll for pre-existing messages…`);
-        catchUpPoll();
-      };
-
-      es.onmessage = e => {
-        console.log(`[ntfy:listen:sse] Raw SSE frame received`);
-        console.log(`[ntfy:listen:sse] e.data (first 200):`, String(e.data).slice(0, 200));
-        let envelope;
-        try {
-          envelope = JSON.parse(e.data);
-        } catch (parseErr) {
-          console.warn(`[ntfy:listen:sse] ✗ JSON parse failed on frame:`, parseErr);
-          return;
-        }
-        console.log(`[ntfy:listen:sse] Envelope event type: "${envelope.event}", has message: ${!!envelope.message}`);
-        if (envelope.event === 'open' || !envelope.message) {
-          console.log(`[ntfy:listen:sse] Skipping keepalive/empty frame`);
-          return;
-        }
-        handleMessage(envelope.message);
-      };
-
-      es.onerror = err => {
-        if (closed) return;
-        console.warn(`[ntfy:listen:sse] ✗ SSE error event fired — readyState: ${es?.readyState}`);
-        console.warn(`[ntfy:listen:sse] Error detail:`, err);
-        if (es) { es.close(); es = null; }
-        console.log(`[ntfy:listen:sse] Falling back to polling`);
-        startPolling();
-      };
-
-    } catch (initErr) {
-      console.error(`[ntfy:listen:sse] ✗ EventSource constructor threw:`, initErr);
-      startPolling();
-    }
-  }
-
-  // ── One-shot catch-up poll (runs once after SSE opens)
-  async function catchUpPoll() {
-    if (closed || messageHandled) return;
-    console.log(`[ntfy:catchup] One-shot poll → ${pollUrl}`);
-    try {
-      const res = await fetch(pollUrl, { signal: AbortSignal.timeout(8000) });
-      console.log(`[ntfy:catchup] ← HTTP ${res.status}`);
-      if (!res.ok) {
-        console.warn(`[ntfy:catchup] Non-OK — skipping, SSE will handle live delivery`);
-        return;
-      }
-      const text = await res.text();
-      console.log(`[ntfy:catchup] Body length: ${text.length}`);
-      if (!text.trim()) {
-        console.log(`[ntfy:catchup] No cached messages — waiting on SSE for live delivery`);
-        return;
-      }
-      const lines = text.trim().split('\n').filter(Boolean);
-      console.log(`[ntfy:catchup] ${lines.length} line(s) to parse`);
-      for (const [i, line] of lines.entries()) {
-        let envelope;
-        try { envelope = JSON.parse(line); }
-        catch { console.warn(`[ntfy:catchup] Line ${i} parse failed`); continue; }
-        console.log(`[ntfy:catchup] Line ${i} — event: "${envelope.event}", has message: ${!!envelope.message}`);
-        if (envelope.event === 'open' || !envelope.message) continue;
-        console.log(`[ntfy:catchup] ✓ Found cached message — handling`);
-        handleMessage(envelope.message);
-        return;
-      }
-      console.log(`[ntfy:catchup] No valid cached message found — SSE standing by for live delivery`);
-    } catch (err) {
-      console.warn(`[ntfy:catchup] fetch error:`, err);
-    }
-  }
-
-  // ── Polling fallback
-  function startPolling() {
-    if (closed) { console.log(`[ntfy:listen:poll] Aborted — already closed`); return; }
-    console.log(`[ntfy:listen:poll] Starting poll every ${POLL_INTERVAL}ms, max ${MAX_POLL} attempts`);
-
-    async function poll() {
-      if (closed) return;
-      pollAttempts++;
-      console.log(`[ntfy:listen:poll] Attempt ${pollAttempts}/${MAX_POLL} → GET ${pollUrl}`);
-
-      if (pollAttempts > MAX_POLL) {
-        console.error(`[ntfy:listen:poll] ✗ Max attempts reached — giving up`);
-        cleanup();
-        if (onError) onError(new Error('Timed out waiting for peer'));
-        return;
-      }
-
-      let res;
-      try {
-        res = await fetch(pollUrl, { signal: AbortSignal.timeout(8000) });
-      } catch (fetchErr) {
-        console.warn(`[ntfy:listen:poll] ✗ fetch threw (network or timeout):`, fetchErr);
-        return;
-      }
-
-      console.log(`[ntfy:listen:poll] ← HTTP ${res.status}`);
-
-      if (!res.ok) {
-        console.warn(`[ntfy:listen:poll] ✗ Non-OK response — rate limited or server error`);
-        return;
-      }
-
-      let text;
-      try {
-        text = await res.text();
-      } catch (readErr) {
-        console.warn(`[ntfy:listen:poll] ✗ Failed to read response body:`, readErr);
-        return;
-      }
-
-      console.log(`[ntfy:listen:poll] Response body length: ${text.length}, lines: ${text.trim().split('\n').filter(Boolean).length}`);
-
-      if (!text.trim()) {
-        console.log(`[ntfy:listen:poll] Empty response — no messages yet`);
-        return;
-      }
-
-      const lines = text.trim().split('\n').filter(Boolean);
-      console.log(`[ntfy:listen:poll] Parsing ${lines.length} line(s)…`);
-
-      for (const [i, line] of lines.entries()) {
-        let envelope;
-        try {
-          envelope = JSON.parse(line);
-        } catch (parseErr) {
-          console.warn(`[ntfy:listen:poll] ✗ Line ${i} JSON parse failed:`, parseErr);
-          continue;
-        }
-        console.log(`[ntfy:listen:poll] Line ${i} — event: "${envelope.event}", has message: ${!!envelope.message}`);
-        if (envelope.event === 'open' || !envelope.message) continue;
-        handleMessage(envelope.message);
-        return;
-      }
-
-      console.log(`[ntfy:listen:poll] No valid message found in this response — will retry`);
-    }
-
-    poll();
-    pollTimer = setInterval(poll, POLL_INTERVAL);
-  }
-
-  trySSE();
-
-  return { close: cleanup };
+  showSignalingModal('offer-ntfy', {
+    link,
+    roomId: state.room.id,
+  });
 }
 
 
@@ -723,8 +924,14 @@ function handleDataMessage(entry, msg) {
       break;
 
     case 'chat':
+      // Drop if we already processed this message (relay loop guard)
+      if (seenMsgIds.has(msg.msgId)) {
+        console.log(`[chat] Dropping duplicate msgId ${msg.msgId}`);
+        break;
+      }
+      seenMsgIds.add(msg.msgId);
       addChatMessage('them', msg.text, msg.name);
-      // Relay to all other peers (so B sees C's message and vice versa)
+      // Relay to all other peers except the one who sent it
       state.peers.forEach(pe => {
         if (pe.id !== entry.id && pe.dc?.readyState === 'open') {
           pe.dc.send(JSON.stringify(msg));
@@ -838,11 +1045,17 @@ function handleDataMessage(entry, msg) {
   }
 }
 
+const seenMsgIds = new Set();
+
 function broadcastChat(text) {
+  const msgId = uuid();
+  seenMsgIds.add(msgId); // mark as seen so we don't re-display if relayed back
   const payload = JSON.stringify({
-    type: 'chat',
+    type:   'chat',
     text,
-    name: state.profile.name || 'You',
+    name:   state.profile.name || 'You',
+    sender: state.localPeerId,
+    msgId,
   });
   state.peers.forEach(pe => {
     if (pe.dc?.readyState === 'open') pe.dc.send(payload);
@@ -1246,44 +1459,58 @@ function showSignalingModal(mode, ctx) {
   body.innerHTML = '';
 
   if (mode === 'offer-ntfy') {
+    // Calculate time remaining
+    const msLeft     = state.room.expiresAt ? Math.max(0, state.room.expiresAt - Date.now()) : 0;
+    const minLeft    = Math.ceil(msLeft / 60000);
+    const expiresTxt = msLeft > 0 ? `expires in ~${minLeft} min` : 'expired';
+
     body.innerHTML = `
-      <p class="step-label">Share this link</p>
+      <p class="step-label">Room Link</p>
       <p class="step-desc">
-        Send this link to your peer. Once they open it the connection
-        establishes <strong>automatically</strong> — no code exchange needed.
+        Share this link — anyone who opens it joins the call automatically.
+        The link is reusable until it expires.
       </p>
       <div class="link-box">
         <input type="text" id="offerLinkInput" readonly value="${ctx.link}" />
         <button class="btn btn-primary sm" id="btnCopyLink">Copy</button>
       </div>
-      <div class="divider"><span>waiting for peer…</span></div>
-      <div style="display:flex;align-items:center;gap:.75rem;padding:.5rem 0;">
-        <span class="conn-dot connecting" style="width:10px;height:10px;flex-shrink:0;"></span>
-        <span style="font-size:.85rem;color:var(--txt-2);font-family:var(--font-mono);" id="ntfyStatusMsg">
-          Offer published to ntfy.sh — listening for answer…
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:.6rem;">
+        <div style="display:flex;align-items:center;gap:.6rem;">
+          <span class="conn-dot connecting" style="width:8px;height:8px;flex-shrink:0;"></span>
+          <span style="font-size:.78rem;color:var(--txt-2);font-family:var(--font-mono);">
+            Listening for new peers…
+          </span>
+        </div>
+        <span style="font-size:.75rem;font-family:var(--font-mono);color:var(--txt-3);" id="roomExpiry">
+          ${expiresTxt}
         </span>
       </div>
-      <div class="divider"><span>manual fallback</span></div>
-      <p class="step-desc" style="font-size:.8rem;">
-        If auto-connect fails, copy the offer code and ask your peer
-        to paste it at <strong>Join a Call → manual code</strong>.
-      </p>
-      <textarea class="sig-box" id="offerCodeBox" readonly>${encode(ctx.offerPayload)}</textarea>
-      <div class="btn-row">
-        <button class="btn btn-ghost sm" id="btnCopyCode">Copy Offer Code</button>
-        <button class="btn btn-ghost sm danger" id="btnCancelListen">Cancel</button>
+      <div class="btn-row" style="margin-top:1rem;">
+        <button class="btn btn-ghost sm" id="btnRefreshRoom">↻ Refresh link</button>
+        <button class="btn btn-ghost sm" id="btnHideInvite">Hide panel</button>
       </div>`;
 
     showModal('signalingModal');
 
-    $('btnCopyLink').onclick = () => copyToClipboard(ctx.link);
-    $('btnCopyCode').onclick  = () => copyToClipboard($('offerCodeBox').value);
-    $('btnCancelListen').onclick = () => {
-      ctx.entry._answerListener?.close();
-      ctx.entry._answerListener = null;
-      hideModal('signalingModal');
+    $('btnCopyLink').onclick     = () => copyToClipboard(ctx.link);
+    $('btnRefreshRoom').onclick  = async () => {
+      // Force refresh by clearing expiry
+      state.room.expiresAt = 0;
+      await initiateCall(true);
     };
-    return; // important — don't fall through
+    $('btnHideInvite').onclick   = () => hideModal('signalingModal');
+
+    // Live countdown
+    const countdownTimer = setInterval(() => {
+      const el = $('roomExpiry');
+      if (!el) { clearInterval(countdownTimer); return; }
+      const ms  = state.room.expiresAt ? Math.max(0, state.room.expiresAt - Date.now()) : 0;
+      const min = Math.ceil(ms / 60000);
+      el.textContent = ms > 0 ? `expires in ~${min} min` : 'expired — refresh link';
+      el.style.color = ms < 60000 ? 'var(--danger)' : 'var(--txt-3)';
+    }, 10000);
+
+    return;
   }
 
   if (mode === 'offer') {
@@ -1718,6 +1945,7 @@ function endCall() {
   DOM.globalDot.className = 'conn-dot';
   DOM.globalLabel.textContent = 'Idle';
   // Clear URL hash
+  stopRoom();
   history.replaceState(null, '', location.pathname);
   refreshGridClass();
   unlockSettings();
@@ -1734,7 +1962,7 @@ function checkUrlHash() {
   if (hash.startsWith('room:')) {
     const roomId = hash.slice(5);
     if (!roomId) return;
-    showJoinSpinner(roomId);
+    checkProfileBeforeCall(() => joinRoom(roomId));
     return;
   }
 
@@ -1822,7 +2050,20 @@ function openJoinModal() {
 
 DOM.btnToggleSignaling.onclick = toggleSignalingModal;
 // Topbar
-DOM.btnAddPeer.onclick = () => initiateCall(true);
+DOM.btnAddPeer.onclick = async () => {
+  // If modal already open just toggle it
+  if (DOM.signalingModal.classList.contains('open')) {
+    hideModal('signalingModal');
+    return;
+  }
+  // Refresh room offer if expired or not yet created
+  const needsRefresh = !state.room.expiresAt || Date.now() >= state.room.expiresAt;
+  if (needsRefresh) {
+    console.log('[room] Link expired or missing — regenerating before showing panel');
+    state.room.expiresAt = 0; // force refresh
+  }
+  await initiateCall(true);
+};
 DOM.btnEndCall.onclick = () => { if (confirm('End the call?')) endCall(); };
 DOM.btnOpenSettings.onclick = openSettings;
 DOM.btnOpenSettingsCall.onclick = openSettings;

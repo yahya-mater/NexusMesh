@@ -40,12 +40,16 @@ const state = {
   profile: loadProfile(),
   localPeerId: uuid(),
   room: {
-    id:          null,   // current roomId
-    link:        null,   // shareable URL
-    expiresAt:   null,   // Date.now() + TTL_MS
-    answerPoller: null,  // interval handle
-    seenAnswers: new Set(), // stableIds we already processed
-    pc:          null,   // the room offer RTCPeerConnection (reused for each joiner)
+    id:             null,
+    link:           null,
+    expiresAt:      null,
+    answerPoller:   null,
+    answerSSE:      null,
+    seenAnswers:    new Set(),
+    pc:             null,
+    _manualPC:      null,
+    _manualPeerId:  null,
+    _countdownTimer: null,
   },
 };
 
@@ -388,8 +392,11 @@ function listenForDirectAnswer(entry, joinerStableId) {
     console.error('[room] Direct answer listener error:', err);
   });
 
-  // Auto-cancel after 2 min
-  setTimeout(() => listener.close(), 120000);
+  // Auto-cancel after 3 min — but only close the listener, never navigate
+  setTimeout(() => {
+    listener.close();
+    console.log(`[room] Direct answer listener for ${joinerStableId} expired cleanly`);
+  }, 180000);
 }
 
 // Called on the joiner side when they open a room link
@@ -432,9 +439,10 @@ async function joinRoom(roomId) {
 
   if (!roomOffer) {
     console.error('[room] Could not fetch room offer — expired or invalid');
-    toast('Room link expired or invalid', 'error');
+    toast('Room link expired or invalid — ask host to refresh the link', 'error');
     hideModal('signalingModal');
-    showSplash();
+    // Only go to splash if we have no active connections
+    if (state.peers.length === 0) showSplash();
     return;
   }
 
@@ -513,25 +521,27 @@ async function joinRoom(roomId) {
     console.log(`[room] ✓ Direct answer sent to host — P2P handshake complete`);
     listener.close();
   }, err => {
+    // Only show error — never navigate away if a P2P connection is already live
     console.error('[room] Direct offer listener error:', err);
-    toast('Connection timed out — try rejoining', 'error');
+    if (state.peers.length === 0) {
+      toast('Connection timed out — try rejoining', 'error');
+    } else {
+      console.log('[room] Listener timed out but peer connections are live — ignoring');
+    }
   });
 }
 
 function stopRoom() {
-  if (state.room.answerPoller) {
-    clearInterval(state.room.answerPoller);
-    state.room.answerPoller = null;
-  }
-  if (state.room.answerSSE) {
-    state.room.answerSSE.close();
-    state.room.answerSSE = null;
-  }
-  state.room.id        = null;
-  state.room.link      = null;
-  state.room.expiresAt = null;
-  state.room.seenAnswers = new Set();
-  console.log('[room] Room stopped');
+  if (state.room.answerPoller)   { clearInterval(state.room.answerPoller); state.room.answerPoller = null; }
+  if (state.room.answerSSE)      { state.room.answerSSE.close(); state.room.answerSSE = null; }
+  if (state.room._countdownTimer){ clearInterval(state.room._countdownTimer); state.room._countdownTimer = null; }
+  if (state.room._manualPC)      { state.room._manualPC.close(); state.room._manualPC = null; }
+  state.room.id            = null;
+  state.room.link          = null;
+  state.room.expiresAt     = null;
+  state.room._manualPeerId = null;
+  state.room.seenAnswers   = new Set();
+  console.log('[room] Room stopped and cleaned up');
 }
 
 /* ═══════════════════════════════════════════════════ NTFY SIGNALING */
@@ -1640,6 +1650,28 @@ function buildLink(encoded) {
 }
 
 /* ═══════════════════════════════════════════════════ SIGNALING MODAL UI */
+async function generateManualOffer() {
+  // Create a fresh peer connection for manual signaling fallback
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(t => pc.addTrack(t, state.localStream));
+  }
+  pc.createDataChannel('nexus', { ordered: true });
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForICE(pc);
+  const payload = {
+    type:   'offer',
+    sdp:    pc.localDescription,
+    peerId: uuid(),
+    fromId: state.localPeerId,
+  };
+  // Store so we can finalize if someone uses the manual code
+  state.room._manualPC = pc;
+  state.room._manualPeerId = payload.peerId;
+  return encode(payload);
+}
+
 function showSignalingModalLoading() {
   DOM.signalingTitle.textContent = 'Preparing Call…';
   DOM.signalingBody.innerHTML = `
@@ -1661,9 +1693,9 @@ function showSignalingModal(mode, ctx) {
 
   if (mode === 'offer-ntfy') {
     // Calculate time remaining
-    const msLeft     = state.room.expiresAt ? Math.max(0, state.room.expiresAt - Date.now()) : 0;
-    const minLeft    = Math.ceil(msLeft / 60000);
-    const expiresTxt = msLeft > 0 ? `expires in ~${minLeft} min` : 'expired';
+    const msLeft     = state.room.expiresAt ? Math.max(0, state.room.expiresAt - Date.now()) : NTFY_TTL_MS;
+    const minLeft    = Math.max(1, Math.ceil(msLeft / 60000));
+    const expiresTxt = `expires in ~${minLeft} min`;
 
     body.innerHTML = `
       <p class="step-label">Room Link</p>
@@ -1689,27 +1721,51 @@ function showSignalingModal(mode, ctx) {
       <div class="btn-row" style="margin-top:1rem;">
         <button class="btn btn-ghost sm" id="btnRefreshRoom">↻ Refresh link</button>
         <button class="btn btn-ghost sm" id="btnHideInvite">Hide panel</button>
+      </div>
+      <div class="divider"><span>manual fallback</span></div>
+      <p class="step-desc" style="font-size:.82rem;color:var(--txt-2);">
+        If the link doesn't work, ask your peer to click
+        <strong>Join a Call</strong> and paste the code below.
+      </p>
+      <p class="step-label">Join Code</p>
+      <textarea class="sig-box" id="manualOfferBox" readonly style="min-height:70px;font-size:.72rem;"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-ghost sm" id="btnCopyManualOffer">Copy Code</button>
       </div>`;
 
     showModal('signalingModal');
 
-    $('btnCopyLink').onclick     = () => copyToClipboard(ctx.link);
-    $('btnRefreshRoom').onclick  = async () => {
-      // Force refresh by clearing expiry
+    $('btnCopyLink').onclick    = () => copyToClipboard(ctx.link);
+    $('btnRefreshRoom').onclick = async () => {
       state.room.expiresAt = 0;
       await initiateCall(true);
     };
-    $('btnHideInvite').onclick   = () => hideModal('signalingModal');
+    $('btnHideInvite').onclick  = () => hideModal('signalingModal');
 
-    // Live countdown
-    const countdownTimer = setInterval(() => {
+    // Populate manual offer code asynchronously
+    generateManualOffer().then(code => {
+      const box = $('manualOfferBox');
+      if (box) box.value = code || '';
+    });
+    $('btnCopyManualOffer').onclick = () => {
+      const box = $('manualOfferBox');
+      if (box?.value) copyToClipboard(box.value);
+    };
+
+    // Live countdown — clears itself when element is gone
+    if (state.room._countdownTimer) clearInterval(state.room._countdownTimer);
+    state.room._countdownTimer = setInterval(() => {
       const el = $('roomExpiry');
-      if (!el) { clearInterval(countdownTimer); return; }
+      if (!el) {
+        clearInterval(state.room._countdownTimer);
+        state.room._countdownTimer = null;
+        return;
+      }
       const ms  = state.room.expiresAt ? Math.max(0, state.room.expiresAt - Date.now()) : 0;
-      const min = Math.ceil(ms / 60000);
-      el.textContent = ms > 0 ? `expires in ~${min} min` : 'expired — refresh link';
-      el.style.color = ms < 60000 ? 'var(--danger)' : 'var(--txt-3)';
-    }, 10000);
+      const min = Math.max(1, Math.ceil(ms / 60000));
+      el.textContent = ms > 0 ? `expires in ~${min} min` : 'expired — click Refresh';
+      el.style.color = ms < 120000 ? 'var(--danger)' : 'var(--txt-3)';
+    }, 30000);
 
     return;
   }
@@ -2242,10 +2298,17 @@ function openJoinModal() {
     let raw = $('joinOfferInput').value.trim();
     if (!raw) { toast('Paste the offer first', 'error'); return; }
     if (raw.includes('#')) raw = raw.split('#').pop();
+    
     const data = decode(raw);
-    if (!data || data.type !== 'offer') { toast('Invalid offer code', 'error'); return; }
+    if (!data) { toast('Invalid code', 'error'); return; }
     hideModal('signalingModal');
-    await joinCall(data);
+    if (data.type === 'offer') {
+      await joinCall(data, null);
+    } else if (data.type === 'room-offer' && data.roomId) {
+      await joinRoom(data.roomId);
+    } else {
+      toast('Unrecognised code format', 'error');
+    }
   };
 }
 

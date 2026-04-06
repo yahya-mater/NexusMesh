@@ -325,11 +325,7 @@ async function processRoomAnswer(data) {
   // Create a fresh peer connection for this specific joiner
   const entry = createPeer(uuid());
   entry.stableId = joinerStableId;
-
-  // Re-create offer/answer with a dedicated PC for this peer
   const pc = entry.pc;
-
-  // Add local tracks
   if (state.localStream) {
     state.localStream.getTracks().forEach(t => pc.addTrack(t, state.localStream));
   }
@@ -487,7 +483,6 @@ async function joinRoom(roomId) {
 
     const entry = createPeer(uuid());
     entry.stableId = data.fromId;
-
     if (state.localStream) {
       state.localStream.getTracks().forEach(t => entry.pc.addTrack(t, state.localStream));
     }
@@ -1021,9 +1016,7 @@ function createPeer(id) {
     tileAttached: false,  // tile only added when handshake is confirmed
   };
 
-  if (state.localStream) {
-    state.localStream.getTracks().forEach(t => pc.addTrack(t, state.localStream));
-  }
+  
 
   pc.ontrack = e => {
     e.streams[0]?.getTracks().forEach(t => remoteStream.addTrack(t));
@@ -1549,6 +1542,9 @@ async function joinCall(offerData, roomId) {
 
   const entry = createPeer(offerData.peerId || uuid());
   entry.roomId = roomId;
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(t => entry.pc.addTrack(t, state.localStream));
+  }
 
   await entry.pc.setRemoteDescription(new RTCSessionDescription({
     type: 'offer', sdp: offerData.sdp.sdp || offerData.sdp,
@@ -1859,6 +1855,9 @@ async function createBrokeredOffer(targetStableId, brokerId, brokerEntry) {
   const entry = createPeer(connId);
   entry.stableId = targetStableId;
   entry.isBrokered = true;
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(t => entry.pc.addTrack(t, state.localStream));
+  }
 
   entry.dc = entry.pc.createDataChannel('nexus', { ordered: true });
   setupDataChannel(entry);
@@ -1904,6 +1903,9 @@ async function handleBrokeredOffer(brokerEntry, msg) {
   const entry = createPeer(connId);
   entry.stableId = msg.fromStableId;
   entry.isBrokered = true;
+  if (state.localStream) {
+    state.localStream.getTracks().forEach(t => entry.pc.addTrack(t, state.localStream));
+  }
 
   await entry.pc.setRemoteDescription(new RTCSessionDescription({
     type: 'offer', sdp: msg.sdp.sdp || msg.sdp,

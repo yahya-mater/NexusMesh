@@ -575,6 +575,207 @@ async function ntfyPublish(roomId, leg, payload) {
   console.log(`[ntfy:publish] ✓ Offer published successfully to topic: ${topic}`);
 }
 
+function ntfyListen(roomIdOrTopic, leg, onMessage, onError) {
+  // If leg is empty string, treat first arg as a full topic name
+  const topic   = leg === '' ? roomIdOrTopic : ntfyTopic(roomIdOrTopic, leg);
+  const sseUrl  = `${NTFY_BASE}/${topic}/sse`;
+  const pollUrl = `${NTFY_BASE}/${topic}/json?poll=1&since=all`;
+
+  console.log(`[ntfy:listen] Starting listener — leg: ${leg}, roomId: ${roomId}`);
+  console.log(`[ntfy:listen] SSE  URL: ${sseUrl}`);
+  console.log(`[ntfy:listen] Poll URL: ${pollUrl}`);
+
+  let closed         = false;
+  let es             = null;
+  let pollTimer      = null;
+  let pollAttempts   = 0;
+  let messageHandled = false;
+  const MAX_POLL     = 90;
+  const POLL_INTERVAL = 4000;
+
+  function handleMessage(raw) {
+    console.log(`[ntfy:listen] handleMessage called, already handled: ${messageHandled}, closed: ${closed}`);
+    if (messageHandled || closed) {
+      console.log(`[ntfy:listen] Skipping — already handled or closed`);
+      return;
+    }
+    console.log(`[ntfy:listen] Raw message received (first 120 chars): ${String(raw).slice(0, 120)}…`);
+    const data = decode(raw);
+    if (!data) {
+      console.warn(`[ntfy:listen] ✗ decode() returned null — message may be malformed or wrong encoding`);
+      return;
+    }
+    console.log(`[ntfy:listen] ✓ Decoded payload type: ${data.type}, peerId: ${data.peerId}`);
+    messageHandled = true;
+    cleanup();
+    onMessage(data);
+  }
+
+  function cleanup() {
+    console.log(`[ntfy:listen] cleanup() called — closing SSE and poll timer`);
+    closed = true;
+    if (es)        { es.close(); es = null; console.log(`[ntfy:listen] SSE closed`); }
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; console.log(`[ntfy:listen] Poll timer cleared`); }
+  }
+
+  // ── SSE
+  function trySSE() {
+    console.log(`[ntfy:listen:sse] Opening EventSource → ${sseUrl}`);
+    try {
+      es = new EventSource(sseUrl);
+
+      es.onopen = () => {
+        console.log(`[ntfy:listen:sse] ✓ Connection opened`);
+        // Immediately do a one-shot poll to catch messages published
+        // before we started listening (race condition between publish and subscribe)
+        console.log(`[ntfy:listen:sse] Running catch-up poll for pre-existing messages…`);
+        catchUpPoll();
+      };
+
+      es.onmessage = e => {
+        console.log(`[ntfy:listen:sse] Raw SSE frame received`);
+        console.log(`[ntfy:listen:sse] e.data (first 200):`, String(e.data).slice(0, 200));
+        let envelope;
+        try {
+          envelope = JSON.parse(e.data);
+        } catch (parseErr) {
+          console.warn(`[ntfy:listen:sse] ✗ JSON parse failed on frame:`, parseErr);
+          return;
+        }
+        console.log(`[ntfy:listen:sse] Envelope event type: "${envelope.event}", has message: ${!!envelope.message}`);
+        if (envelope.event === 'open' || !envelope.message) {
+          console.log(`[ntfy:listen:sse] Skipping keepalive/empty frame`);
+          return;
+        }
+        handleMessage(envelope.message);
+      };
+
+      es.onerror = err => {
+        if (closed) return;
+        console.warn(`[ntfy:listen:sse] ✗ SSE error event fired — readyState: ${es?.readyState}`);
+        console.warn(`[ntfy:listen:sse] Error detail:`, err);
+        if (es) { es.close(); es = null; }
+        console.log(`[ntfy:listen:sse] Falling back to polling`);
+        startPolling();
+      };
+
+    } catch (initErr) {
+      console.error(`[ntfy:listen:sse] ✗ EventSource constructor threw:`, initErr);
+      startPolling();
+    }
+  }
+
+  // ── One-shot catch-up poll (runs once after SSE opens)
+  async function catchUpPoll() {
+    if (closed || messageHandled) return;
+    console.log(`[ntfy:catchup] One-shot poll → ${pollUrl}`);
+    try {
+      const res = await fetch(pollUrl, { signal: AbortSignal.timeout(8000) });
+      console.log(`[ntfy:catchup] ← HTTP ${res.status}`);
+      if (!res.ok) {
+        console.warn(`[ntfy:catchup] Non-OK — skipping, SSE will handle live delivery`);
+        return;
+      }
+      const text = await res.text();
+      console.log(`[ntfy:catchup] Body length: ${text.length}`);
+      if (!text.trim()) {
+        console.log(`[ntfy:catchup] No cached messages — waiting on SSE for live delivery`);
+        return;
+      }
+      const lines = text.trim().split('\n').filter(Boolean);
+      console.log(`[ntfy:catchup] ${lines.length} line(s) to parse`);
+      for (const [i, line] of lines.entries()) {
+        let envelope;
+        try { envelope = JSON.parse(line); }
+        catch { console.warn(`[ntfy:catchup] Line ${i} parse failed`); continue; }
+        console.log(`[ntfy:catchup] Line ${i} — event: "${envelope.event}", has message: ${!!envelope.message}`);
+        if (envelope.event === 'open' || !envelope.message) continue;
+        console.log(`[ntfy:catchup] ✓ Found cached message — handling`);
+        handleMessage(envelope.message);
+        return;
+      }
+      console.log(`[ntfy:catchup] No valid cached message found — SSE standing by for live delivery`);
+    } catch (err) {
+      console.warn(`[ntfy:catchup] fetch error:`, err);
+    }
+  }
+
+  // ── Polling fallback
+  function startPolling() {
+    if (closed) { console.log(`[ntfy:listen:poll] Aborted — already closed`); return; }
+    console.log(`[ntfy:listen:poll] Starting poll every ${POLL_INTERVAL}ms, max ${MAX_POLL} attempts`);
+
+    async function poll() {
+      if (closed) return;
+      pollAttempts++;
+      console.log(`[ntfy:listen:poll] Attempt ${pollAttempts}/${MAX_POLL} → GET ${pollUrl}`);
+
+      if (pollAttempts > MAX_POLL) {
+        console.error(`[ntfy:listen:poll] ✗ Max attempts reached — giving up`);
+        cleanup();
+        if (onError) onError(new Error('Timed out waiting for peer'));
+        return;
+      }
+
+      let res;
+      try {
+        res = await fetch(pollUrl, { signal: AbortSignal.timeout(8000) });
+      } catch (fetchErr) {
+        console.warn(`[ntfy:listen:poll] ✗ fetch threw (network or timeout):`, fetchErr);
+        return;
+      }
+
+      console.log(`[ntfy:listen:poll] ← HTTP ${res.status}`);
+
+      if (!res.ok) {
+        console.warn(`[ntfy:listen:poll] ✗ Non-OK response — rate limited or server error`);
+        return;
+      }
+
+      let text;
+      try {
+        text = await res.text();
+      } catch (readErr) {
+        console.warn(`[ntfy:listen:poll] ✗ Failed to read response body:`, readErr);
+        return;
+      }
+
+      console.log(`[ntfy:listen:poll] Response body length: ${text.length}, lines: ${text.trim().split('\n').filter(Boolean).length}`);
+
+      if (!text.trim()) {
+        console.log(`[ntfy:listen:poll] Empty response — no messages yet`);
+        return;
+      }
+
+      const lines = text.trim().split('\n').filter(Boolean);
+      console.log(`[ntfy:listen:poll] Parsing ${lines.length} line(s)…`);
+
+      for (const [i, line] of lines.entries()) {
+        let envelope;
+        try {
+          envelope = JSON.parse(line);
+        } catch (parseErr) {
+          console.warn(`[ntfy:listen:poll] ✗ Line ${i} JSON parse failed:`, parseErr);
+          continue;
+        }
+        console.log(`[ntfy:listen:poll] Line ${i} — event: "${envelope.event}", has message: ${!!envelope.message}`);
+        if (envelope.event === 'open' || !envelope.message) continue;
+        handleMessage(envelope.message);
+        return;
+      }
+
+      console.log(`[ntfy:listen:poll] No valid message found in this response — will retry`);
+    }
+
+    poll();
+    pollTimer = setInterval(poll, POLL_INTERVAL);
+  }
+
+  trySSE();
+
+  return { close: cleanup };
+}
+
 async function initiateCall(isAddPeer = false) {
   if (!isAddPeer) {
     showCallScreen();

@@ -385,6 +385,7 @@ function listenForDirectAnswer(entry, joinerStableId) {
     entry.pc.setRemoteDescription(new RTCSessionDescription({
       type: 'answer', sdp: data.sdp.sdp || data.sdp,
     })).then(() => {
+      attachPeerTile(entry);
       console.log(`[room] ✓ Direct connection established with ${joinerStableId}`);
       toast(`${entry.info?.name || 'A peer'} joined`, 'success');
     }).catch(e => console.error('[room] setRemoteDescription failed:', e));
@@ -494,6 +495,7 @@ async function joinRoom(roomId) {
     await entry.pc.setRemoteDescription(new RTCSessionDescription({
       type: 'offer', sdp: data.sdp.sdp || data.sdp,
     }));
+    attachPeerTile(entry);
 
     const answer = await entry.pc.createAnswer();
     await entry.pc.setLocalDescription(answer);
@@ -1035,10 +1037,7 @@ function createPeer(id) {
     console.log(`[${id}] connectionState →`, s);
     entry.status = s;
 
-    // Attach tile on first sign of life if not already attached
-    if ((s === 'connecting' || s === 'connected') && !entry.tileAttached) {
-      attachPeerTile(entry);
-    }
+    // Tile is attached when setRemoteDescription is called — not here
 
     updatePeerTileStatus(entry);
     updateGlobalStatus();
@@ -1554,6 +1553,7 @@ async function joinCall(offerData, roomId) {
   await entry.pc.setRemoteDescription(new RTCSessionDescription({
     type: 'offer', sdp: offerData.sdp.sdp || offerData.sdp,
   }));
+  attachPeerTile(entry);
 
   const answer = await entry.pc.createAnswer();
   await entry.pc.setLocalDescription(answer);
@@ -1908,6 +1908,7 @@ async function handleBrokeredOffer(brokerEntry, msg) {
   await entry.pc.setRemoteDescription(new RTCSessionDescription({
     type: 'offer', sdp: msg.sdp.sdp || msg.sdp,
   }));
+  attachPeerTile(entry);
 
   const answer = await entry.pc.createAnswer();
   await entry.pc.setLocalDescription(answer);
@@ -1946,6 +1947,7 @@ async function handleBrokeredAnswer(msg) {
   await entry.pc.setRemoteDescription(new RTCSessionDescription({
     type: 'answer', sdp: msg.sdp.sdp || msg.sdp,
   }));
+  attachPeerTile(entry);
   console.log(`[mesh] ✓ Brokered connection finalized with ${msg.fromStableId}`);
 }
 

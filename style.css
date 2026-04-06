@@ -279,9 +279,11 @@ input  { font-family: inherit; }
   width: 100%; height: 100%;
   object-fit: cover;
   display: block;
-  transform: scaleX(-1);
+  transform: none;   /* default — no flip */
 }
-.video-tile.remote-tile video { transform: none; }
+.video-tile.local-tile video.mirror {
+  transform: scaleX(-1);  /* mirror only when explicitly set */
+}
 
 .tile-overlay {
   position: absolute; inset: 0;

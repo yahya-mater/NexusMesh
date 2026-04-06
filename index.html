@@ -59,10 +59,13 @@
       </div>
     </div>
     <div class="topbar-right">
+      <button class="icon-btn" id="btnToggleSignaling" title="Show/hide invite panel" style="display:none;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.72"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+      </button>
       <button class="icon-btn" id="btnAddPeer" title="Add another peer">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 5v14M5 12h14"/></svg>
       </button>
-      <button class="icon-btn" id="btnOpenSettingsCall" title="Profile">
+      <button class="icon-btn" id="btnOpenSettingsCall" title="Profile — locked during call" id="btnOpenSettingsCall">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
       </button>
       <button class="icon-btn danger" id="btnEndCall" title="End call">
@@ -157,7 +160,9 @@
           <button class="btn btn-ghost sm" id="btnClearAvatar">Clear</button>
         </div>
       </div>
-
+      <p id="settingsLockNotice" style="display:none;font-family:var(--font-mono);font-size:.78rem;color:var(--accent);margin-top:1rem;padding:.6rem .85rem;background:var(--bg-3);border-radius:var(--radius);border:1px solid var(--border);">
+        ⊘ Profile is locked during a call
+      </p>
       <button class="btn btn-primary" id="btnSaveSettings" style="margin-top:1.6rem;width:100%;">Save Profile</button>
     </div>
   </div>

@@ -26,8 +26,9 @@ const NTFY_PREFIX = 'nexusmesh';
 const NTFY_TTL = 300; // seconds — messages expire after 5 min
 
 /* ═══════════════════════════════════════════════════ STATE */
+
 const state = {
-  peers: [],          // Array<PeerEntry>
+  peers: [],
   localStream: null,
   screenStream: null,
   isMuted: false,
@@ -35,6 +36,7 @@ const state = {
   chatOpen: false,
   unreadCount: 0,
   profile: loadProfile(),
+  localPeerId: null,   // set when first connection is initiated
 };
 
 /*
@@ -88,7 +90,8 @@ const DOM = {
   signalingModal:  $('signalingModal'),
   signalingTitle:  $('signalingTitle'),
   signalingBody:   $('signalingBody'),
-  btnCloseSignaling: $('btnCloseSignaling'),
+  btnCloseSignaling:   $('btnCloseSignaling'),
+  btnToggleSignaling:  $('btnToggleSignaling'),
   // Settings modal
   settingsModal:   $('settingsModal'),
   settingsName:    $('settingsName'),
@@ -404,9 +407,32 @@ function copyToClipboard(text) {
     });
 }
 
-function showModal(id) { $(id).classList.add('open'); }
-function hideModal(id) { $(id).classList.remove('open'); }
+function showModal(id) {
+  $(id).classList.add('open');
+  if (id === 'signalingModal') {
+    DOM.btnToggleSignaling.style.display = 'flex';
+    DOM.btnToggleSignaling.title = 'Hide invite panel';
+    DOM.btnToggleSignaling.classList.add('active');
+  }
+}
 
+function hideModal(id) {
+  $(id).classList.remove('open');
+  if (id === 'signalingModal') {
+    // Don't hide the toggle button — let user re-open
+    DOM.btnToggleSignaling.classList.remove('active');
+    DOM.btnToggleSignaling.title = 'Show invite panel';
+  }
+}
+
+function toggleSignalingModal() {
+  const isOpen = DOM.signalingModal.classList.contains('open');
+  if (isOpen) {
+    hideModal('signalingModal');
+  } else {
+    showModal('signalingModal');
+  }
+}
 /* ═══════════════════════════════════════════════════ PROFILE */
 function loadProfile() {
   try {
@@ -414,9 +440,43 @@ function loadProfile() {
       { name: 'Anonymous', avatar: '' };
   } catch { return { name: 'Anonymous', avatar: '' }; }
 }
+
+function profileExplicitlySet() {
+  return localStorage.getItem('nexusmesh_profile_set') === 'true';
+}
+
 function saveProfile(p) {
   localStorage.setItem('nexusmesh_profile', JSON.stringify(p));
+  localStorage.setItem('nexusmesh_profile_set', 'true');
   state.profile = p;
+  console.log(`[profile] Saved — name: "${p.name}", avatar: ${p.avatar ? 'yes' : 'no'}`);
+}
+
+function lockSettingsDuringCall() {
+  // Make fields read-only
+  DOM.settingsName.readOnly = true;
+  DOM.settingsName.style.opacity = '.5';
+  DOM.avatarFile.disabled = true;
+  DOM.btnClearAvatar.disabled = true;
+  DOM.btnClearAvatar.style.opacity = '.4';
+  DOM.btnSaveSettings.style.display = 'none';
+  $('settingsLockNotice').style.display = 'block';
+  DOM.btnOpenSettingsCall.style.opacity = '.5';
+  DOM.btnOpenSettingsCall.title = 'Profile is locked during a call';
+  console.log('[profile] Settings locked for duration of call');
+}
+
+function unlockSettings() {
+  DOM.settingsName.readOnly = false;
+  DOM.settingsName.style.opacity = '';
+  DOM.avatarFile.disabled = false;
+  DOM.btnClearAvatar.disabled = false;
+  DOM.btnClearAvatar.style.opacity = '';
+  DOM.btnSaveSettings.style.display = '';
+  $('settingsLockNotice').style.display = 'none';
+  DOM.btnOpenSettingsCall.style.opacity = '';
+  DOM.btnOpenSettingsCall.title = 'Profile';
+  console.log('[profile] Settings unlocked');
 }
 
 function renderLocalProfile() {
@@ -447,24 +507,40 @@ function showSplash() {
 /* ═══════════════════════════════════════════════════ MEDIA */
 async function startLocalMedia() {
   if (state.localStream) return state.localStream;
+  state.localStream = new MediaStream();
+
+  // ── Mic
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    state.localStream = stream;
-    DOM.localVideo.srcObject = stream;
-    return stream;
-  } catch (e) {
-    console.warn('getUserMedia failed:', e);
-    toast('Camera/mic unavailable — audio-only mode', 'error');
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
-      state.localStream = stream;
-      return stream;
-    } catch {
-      // No media at all — still allow signaling
-      state.localStream = new MediaStream();
-      return state.localStream;
-    }
+    const audioStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+    audioStream.getAudioTracks().forEach(t => {
+      state.localStream.addTrack(t);
+      console.log(`[media] ✓ Audio track acquired: ${t.label}`);
+    });
+  } catch (err) {
+    console.warn('[media] ✗ Mic permission denied or unavailable:', err.message);
+    toast('Mic unavailable — continuing without audio', 'error');
   }
+
+  // ── Camera (asked separately so mic-only works if cam denied)
+  try {
+    const videoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    videoStream.getVideoTracks().forEach(t => {
+      state.localStream.addTrack(t);
+      console.log(`[media] ✓ Video track acquired: ${t.label}`);
+    });
+  } catch (err) {
+    console.warn('[media] ✗ Camera permission denied or unavailable:', err.message);
+    toast('Camera unavailable — audio-only mode', '');
+    DOM.localNoCam.classList.add('visible');
+  }
+
+  DOM.localVideo.srcObject = state.localStream;
+  // Mirror local cam preview so it feels natural (does not affect sent video)
+  const hasCam = state.localStream.getVideoTracks().length > 0;
+  setLocalVideoMirror(hasCam);
+
+  console.log(`[media] Stream ready — audio tracks: ${state.localStream.getAudioTracks().length}, video tracks: ${state.localStream.getVideoTracks().length}`);
+  return state.localStream;
 }
 
 function toggleMute() {
@@ -488,6 +564,14 @@ function toggleVideo() {
   DOM.btnHideVideo.title = state.isHidden ? 'Show camera' : 'Hide camera';
 }
 
+function setLocalVideoMirror(shouldMirror) {
+  if (shouldMirror) {
+    DOM.localVideo.classList.add('mirror');
+  } else {
+    DOM.localVideo.classList.remove('mirror');
+  }
+}
+
 async function toggleScreenShare() {
   if (state.screenStream) {
     // Stop screen share, restore camera
@@ -502,6 +586,7 @@ async function toggleScreenShare() {
           if (sender) sender.replaceTrack(camTrack).catch(() => {});
         });
         DOM.localVideo.srcObject = state.localStream;
+        setLocalVideoMirror(true);   // back to cam — restore mirror
       }
     }
     return;
@@ -512,6 +597,7 @@ async function toggleScreenShare() {
     DOM.btnShareScreen.classList.add('active');
     const screenTrack = ss.getVideoTracks()[0];
     DOM.localVideo.srcObject = ss;
+    setLocalVideoMirror(false);  // screen share should never be mirrored
     state.peers.forEach(pe => {
       const sender = pe.pc.getSenders().find(s => s.track?.kind === 'video');
       if (sender) sender.replaceTrack(screenTrack).catch(() => {});
@@ -601,14 +687,99 @@ function sendProfile(entry) {
 }
 
 function handleDataMessage(entry, msg) {
+  console.log(`[mesh] message from ${entry.id} — type: ${msg.type}`);
   switch (msg.type) {
+
     case 'profile':
       entry.info = { name: msg.name, avatar: msg.avatar };
       updatePeerTileInfo(entry);
       addChatMessage('system', `${msg.name} joined`);
+      // Broker introductions to existing peers
+      brokerIntroductions(entry);
       break;
+
     case 'chat':
       addChatMessage('them', msg.text, msg.name);
+      // Relay to all other peers (so B sees C's message and vice versa)
+      state.peers.forEach(pe => {
+        if (pe.id !== entry.id && pe.dc?.readyState === 'open') {
+          pe.dc.send(JSON.stringify(msg));
+        }
+      });
+      break;
+
+    // ── Mesh brokering ──────────────────────────────────────────
+    case 'introduce-peers':
+      // C receives list of existing peers from broker — initiate with each
+      console.log(`[mesh] received peer list — ${msg.peers.length} peer(s) to connect`);
+      msg.peers.forEach(peerInfo => handleIntroduction(peerInfo));
+      break;
+
+    case 'create-offer-for':
+      // We are being asked to create an offer for a new peer
+      console.log(`[mesh] create-offer-for ${msg.targetId} via broker ${msg.brokerId}`);
+      createBrokeredOffer(msg.targetId, msg.brokerId, entry);
+      break;
+
+    case 'broker-offer':
+      // Are we the target or just a relay?
+      if (msg.targetId === state.localPeerId) {
+        console.log(`[mesh] broker-offer for us from ${msg.fromId}`);
+        handleBrokeredOffer(entry, msg);
+      } else {
+        console.log(`[mesh] Forwarding broker-offer to ${msg.targetId}`);
+        forwardBrokerMessage(entry, msg);
+      }
+      break;
+
+    case 'broker-answer':
+      if (msg.targetId === state.localPeerId) {
+        console.log(`[mesh] broker-answer for us from ${msg.fromId}`);
+        handleBrokeredAnswer(msg);
+      } else {
+        console.log(`[mesh] Forwarding broker-answer to ${msg.targetId}`);
+        forwardBrokerMessage(entry, msg);
+      }
+      break;
+
+    case 'broker-ice':
+      if (msg.forId === state.localPeerId) {
+        console.log(`[mesh] broker-ice for us from ${msg.fromId}`);
+        handleBrokeredIce(msg);
+      } else {
+        console.log(`[mesh] Forwarding broker-ice to ${msg.forId}`);
+        const fwdTarget = state.peers.find(pe => pe.id === msg.forId);
+        if (fwdTarget?.dc?.readyState === 'open') {
+          fwdTarget.dc.send(JSON.stringify(msg));
+        }
+      }
+      break;
+
+    case 'peer-left':
+      console.log(`[mesh] peer-left — ${msg.peerId}`);
+      removePeer(msg.peerId);
+      addChatMessage('system', `${msg.name || 'A peer'} left`);
+      break;
+
+    // ── Selective muting ────────────────────────────────────────
+    case 'mute-video':
+      console.log(`[mesh] ${entry.id} asked us to pause video to them`);
+      pauseTrackToPeer(entry.id, 'video');
+      break;
+
+    case 'unmute-video':
+      console.log(`[mesh] ${entry.id} asked us to resume video to them`);
+      resumeTrackToPeer(entry.id, 'video');
+      break;
+
+    case 'mute-audio':
+      console.log(`[mesh] ${entry.id} asked us to pause audio to them`);
+      pauseTrackToPeer(entry.id, 'audio');
+      break;
+
+    case 'unmute-audio':
+      console.log(`[mesh] ${entry.id} asked us to resume audio to them`);
+      resumeTrackToPeer(entry.id, 'audio');
       break;
   }
 }
@@ -648,7 +819,50 @@ function addRemoteTile(entry) {
     <span class="peer-avatar" data-avatar-for="${entry.id}">?</span>
     <span class="peer-name" data-name-for="${entry.id}">Connecting…</span>`;
 
+  // Per-peer selective mute controls
+  const peerControls = document.createElement('div');
+  peerControls.className = 'tile-controls';
+
+  const muteCamBtn = document.createElement('button');
+  muteCamBtn.className = 'tile-btn';
+  muteCamBtn.title = "Stop receiving their video";
+  muteCamBtn.dataset.muteVideo = 'false';
+  muteCamBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>`;
+  muteCamBtn.onclick = () => {
+    const isMuted = muteCamBtn.dataset.muteVideo === 'true';
+    const next = !isMuted;
+    muteCamBtn.dataset.muteVideo = String(next);
+    muteCamBtn.classList.toggle('muted', next);
+    muteCamBtn.title = next ? 'Resume their video' : 'Stop receiving their video';
+    // Tell that peer to stop/resume sending video to us
+    sendMuteRequest(entry.id, 'video', next);
+    // Visually hide their video tile
+    if (entry.videoEl) entry.videoEl.style.visibility = next ? 'hidden' : 'visible';
+    console.log(`[mute] ${next ? 'Muted' : 'Unmuted'} video from ${entry.id}`);
+  };
+
+  const muteAudioBtn = document.createElement('button');
+  muteAudioBtn.className = 'tile-btn';
+  muteAudioBtn.title = "Stop receiving their audio";
+  muteAudioBtn.dataset.muteAudio = 'false';
+  muteAudioBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8"/></svg>`;
+  muteAudioBtn.onclick = () => {
+    const isMuted = muteAudioBtn.dataset.muteAudio === 'true';
+    const next = !isMuted;
+    muteAudioBtn.dataset.muteAudio = String(next);
+    muteAudioBtn.classList.toggle('muted', next);
+    muteAudioBtn.title = next ? 'Resume their audio' : 'Stop receiving their audio';
+    sendMuteRequest(entry.id, 'audio', next);
+    // Locally mute their audio track in the video element
+    if (entry.videoEl) entry.videoEl.muted = next;
+    console.log(`[mute] ${next ? 'Muted' : 'Unmuted'} audio from ${entry.id}`);
+  };
+
+  peerControls.appendChild(muteCamBtn);
+  peerControls.appendChild(muteAudioBtn);
+  overlay.appendChild(peerControls);
   overlay.appendChild(peerInfo);
+
   tile.appendChild(video);
   tile.appendChild(statusBadge);
   tile.appendChild(overlay);
@@ -709,6 +923,121 @@ function removePeer(id) {
   updateGlobalStatus();
 }
 
+/* ═══════════════════════════════════════════════════ PRE-CALL PROFILE CHECK */
+function checkProfileBeforeCall(onProceed) {
+  if (profileExplicitlySet()) {
+    console.log(`[profile] Already set as "${state.profile.name}" — proceeding`);
+    onProceed();
+    return;
+  }
+
+  console.log('[profile] Not explicitly set — showing pre-call prompt');
+  DOM.signalingTitle.textContent = 'Before you join…';
+  DOM.signalingBody.innerHTML = `
+    <div style="
+      background:var(--bg-3);
+      border:1px solid var(--border-hi);
+      border-radius:var(--radius);
+      padding:1rem 1.1rem;
+      margin-bottom:.75rem;
+      display:flex;
+      align-items:center;
+      gap:.85rem;">
+      <span style="font-size:2rem;line-height:1;">👤</span>
+      <div>
+        <div style="font-weight:700;font-size:.95rem;margin-bottom:.2rem;">
+          You are joining as <span style="color:var(--accent);">"Anonymous"</span>
+        </div>
+        <div style="font-size:.82rem;color:var(--txt-2);line-height:1.5;">
+          People in the call won't know who you are.<br/>
+          You can set your name now — this cannot be changed once the call starts.
+        </div>
+      </div>
+    </div>
+
+    <label class="field-label">Your Name</label>
+    <input
+      type="text"
+      id="preCallName"
+      class="text-input"
+      placeholder="Enter your name…"
+      maxlength="32"
+      style="margin-top:.35rem;"
+      value="${state.profile.name !== 'Anonymous' ? state.profile.name : ''}"
+    />
+
+    <label class="field-label" style="margin-top:1rem;">Avatar <span style="color:var(--txt-3);font-weight:400;text-transform:none;letter-spacing:0;">(optional)</span></label>
+    <div class="avatar-picker" style="margin-top:.4rem;">
+      <div class="avatar-preview" id="preCallAvatarPreview">
+        ${state.profile.avatar
+          ? `<img src="${state.profile.avatar}" alt="avatar"/>`
+          : (state.profile.name !== 'Anonymous' ? state.profile.name.charAt(0).toUpperCase() : '?')}
+      </div>
+      <div class="avatar-actions">
+        <label class="btn btn-ghost sm" for="preCallAvatarFile">Upload image</label>
+        <input type="file" id="preCallAvatarFile" accept="image/*" style="display:none;" />
+      </div>
+    </div>
+
+    <div class="btn-row" style="margin-top:1.4rem;">
+      <button class="btn btn-primary" id="btnPreCallSave">
+        Save &amp; Continue →
+      </button>
+      <button class="btn btn-ghost sm" id="btnPreCallSkip">
+        Continue as Anonymous
+      </button>
+    </div>`;
+
+  showModal('signalingModal');
+
+  // Avatar upload inside pre-call prompt
+  let pendingAvatar = state.profile.avatar || '';
+  $('preCallAvatarFile').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const size = Math.min(MAX_AVATAR_PX, img.width, img.height);
+        canvas.width = size; canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        const s = Math.min(img.width, img.height);
+        const ox = (img.width - s) / 2, oy = (img.height - s) / 2;
+        ctx.drawImage(img, ox, oy, s, s, 0, 0, size, size);
+        pendingAvatar = canvas.toDataURL('image/jpeg', 0.7);
+        const prev = $('preCallAvatarPreview');
+        if (prev) prev.innerHTML = `<img src="${pendingAvatar}" alt="avatar"/>`;
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
+  $('btnPreCallSave').onclick = () => {
+    const nameVal = ($('preCallName').value || '').trim();
+    const profile = {
+      name:   nameVal || 'Anonymous',
+      avatar: pendingAvatar,
+    };
+    saveProfile(profile);
+    renderLocalProfile();
+    console.log(`[profile] Pre-call profile saved — name: "${profile.name}"`);
+    // Replace body with loading spinner immediately
+    showSignalingModalLoading();
+    onProceed();
+  };
+
+  $('btnPreCallSkip').onclick = () => {
+    // Mark as explicitly set so we don't nag again
+    localStorage.setItem('nexusmesh_profile_set', 'true');
+    console.log('[profile] User chose to continue as Anonymous');
+    showSignalingModalLoading();
+    onProceed();
+  };
+}
+
 /* ═══════════════════════════════════════════════════ SIGNALING FLOW */
 
 /**
@@ -719,11 +1048,15 @@ function removePeer(id) {
  *  4. Encode offer → URL hash / textarea
  */
 async function initiateCall(isAddPeer = false) {
-  await startLocalMedia();
   showCallScreen();
+  showSignalingModalLoading();
+  lockSettingsDuringCall();
+  await startLocalMedia();
 
   const peerId = uuid();
-  const roomId = peerId.slice(0, 10); // short room ID embedded in link
+  const roomId = peerId.slice(0, 10);
+  if (!state.localPeerId) state.localPeerId = peerId;
+  
   const entry = createPeer(peerId);
   entry.roomId = roomId;
 
@@ -775,10 +1108,13 @@ async function initiateCall(isAddPeer = false) {
  *  4. Encode answer → share back
  */
 async function joinCall(offerData, roomId) {
+  lockSettingsDuringCall();
   await startLocalMedia();
   showCallScreen();
   hideModal('signalingModal');
 
+  const newLocalId = uuid();
+  if (!state.localPeerId) state.localPeerId = newLocalId;
   const entry = createPeer(offerData.peerId || uuid());
   entry.roomId = roomId;
 
@@ -839,6 +1175,18 @@ function buildLink(encoded) {
 }
 
 /* ═══════════════════════════════════════════════════ SIGNALING MODAL UI */
+function showSignalingModalLoading() {
+  DOM.signalingTitle.textContent = 'Preparing Call…';
+  DOM.signalingBody.innerHTML = `
+    <div style="display:flex;align-items:center;gap:.75rem;padding:.75rem 0;">
+      <span class="conn-dot connecting" style="width:10px;height:10px;flex-shrink:0;"></span>
+      <span style="font-family:var(--font-mono);font-size:.88rem;color:var(--txt-2);">
+        Requesting camera and microphone…
+      </span>
+    </div>`;
+  showModal('signalingModal');
+}
+
 function showSignalingModal(mode, ctx) {
   DOM.signalingTitle.textContent = mode === 'offer' ? 'Share Invite' :
     mode === 'answer' ? 'Send Your Answer' : 'Add Peer';
@@ -949,6 +1297,230 @@ function showSignalingModal(mode, ctx) {
   }
 }
 
+/* ═══════════════════════════════════════════════════ MESH BROKERING */
+
+// Called by A when a new peer (C) connects — introduce C to all existing peers
+function brokerIntroductions(newEntry) {
+  const existingPeers = state.peers.filter(pe => pe.id !== newEntry.id && pe.status === 'connected');
+  if (existingPeers.length === 0) {
+    console.log('[mesh] No existing peers to introduce');
+    return;
+  }
+  console.log(`[mesh] Brokering introductions — ${existingPeers.length} existing peer(s)`);
+
+  // Tell C about all existing peers
+  const peerList = existingPeers.map(pe => ({
+    peerId: pe.id,
+    name:   pe.info?.name || 'Unknown',
+  }));
+  if (newEntry.dc?.readyState === 'open') {
+    newEntry.dc.send(JSON.stringify({
+      type:  'introduce-peers',
+      peers: peerList,
+    }));
+    console.log(`[mesh] Sent peer list to ${newEntry.id}:`, peerList);
+  }
+
+  // Tell each existing peer to create an offer for the new peer
+  existingPeers.forEach(pe => {
+    if (pe.dc?.readyState === 'open') {
+      pe.dc.send(JSON.stringify({
+        type:       'create-offer-for',
+        targetId:   newEntry.id,
+        brokerId:   state.localPeerId,
+      }));
+      console.log(`[mesh] Asked ${pe.id} to create offer for ${newEntry.id}`);
+    }
+  });
+}
+
+// C received introduction list — prepare to receive offers from each peer
+function handleIntroduction(peerInfo) {
+  console.log(`[mesh] Preparing for introduction to ${peerInfo.peerId}`);
+  // Pre-create the peer entry so we are ready to receive the brokered offer
+  if (!state.peers.find(pe => pe.id === peerInfo.peerId)) {
+    const entry = createPeer(peerInfo.peerId);
+    entry.isBrokered = true;
+    console.log(`[mesh] Pre-created peer entry for ${peerInfo.peerId}`);
+  }
+}
+
+// Existing peer (B) received instruction to create offer for new peer (C)
+async function createBrokeredOffer(targetId, brokerId, brokerEntry) {
+  console.log(`[mesh] Creating brokered offer for ${targetId}`);
+  let entry = state.peers.find(pe => pe.id === targetId);
+  if (!entry) {
+    entry = createPeer(targetId);
+    entry.isBrokered = true;
+  }
+
+  entry.dc = entry.pc.createDataChannel('nexus', { ordered: true });
+  setupDataChannel(entry);
+
+  const offer = await entry.pc.createOffer();
+  await entry.pc.setLocalDescription(offer);
+  await waitForICE(entry.pc);
+
+  const finalSDP = entry.pc.localDescription;
+  console.log(`[mesh] Brokered offer ready — sending via broker ${brokerId}`);
+
+  // Send offer back through broker (A) who will forward to C
+  if (brokerEntry.dc?.readyState === 'open') {
+    brokerEntry.dc.send(JSON.stringify({
+      type:     'broker-offer',
+      fromId:   state.localPeerId,
+      targetId: targetId,
+      sdp:      finalSDP,
+    }));
+  }
+
+  // Listen for brokered ICE from this peer
+  entry.pc.onicecandidate = e => {
+    if (!e.candidate) return;
+    if (brokerEntry.dc?.readyState === 'open') {
+      brokerEntry.dc.send(JSON.stringify({
+        type:     'broker-ice',
+        fromId:   state.localPeerId,
+        forId:    targetId,
+        candidate: e.candidate,
+      }));
+    }
+  };
+}
+
+// C receives a brokered offer from B (forwarded by A)
+async function handleBrokeredOffer(brokerEntry, msg) {
+  let entry = state.peers.find(pe => pe.id === msg.fromId);
+  if (!entry) {
+    entry = createPeer(msg.fromId);
+    entry.isBrokered = true;
+  }
+
+  await entry.pc.setRemoteDescription(new RTCSessionDescription({
+    type: 'offer', sdp: msg.sdp.sdp || msg.sdp,
+  }));
+
+  const answer = await entry.pc.createAnswer();
+  await entry.pc.setLocalDescription(answer);
+  await waitForICE(entry.pc);
+
+  const finalSDP = entry.pc.localDescription;
+  console.log(`[mesh] Brokered answer ready — sending via broker`);
+
+  // Send answer back through broker
+  if (brokerEntry.dc?.readyState === 'open') {
+    brokerEntry.dc.send(JSON.stringify({
+      type:     'broker-answer',
+      fromId:   state.localPeerId,
+      targetId: msg.fromId,
+      sdp:      finalSDP,
+    }));
+  }
+
+  // Forward ICE candidates through broker
+  entry.pc.onicecandidate = e => {
+    if (!e.candidate) return;
+    if (brokerEntry.dc?.readyState === 'open') {
+      brokerEntry.dc.send(JSON.stringify({
+        type:      'broker-ice',
+        fromId:    state.localPeerId,
+        forId:     msg.fromId,
+        candidate: e.candidate,
+      }));
+    }
+  };
+}
+
+// B receives the answer from C (forwarded by A) — finalize B↔C connection
+async function handleBrokeredAnswer(msg) {
+  const entry = state.peers.find(pe => pe.id === msg.fromId);
+  if (!entry) {
+    console.warn(`[mesh] broker-answer — no entry found for ${msg.fromId}`);
+    return;
+  }
+  await entry.pc.setRemoteDescription(new RTCSessionDescription({
+    type: 'answer', sdp: msg.sdp.sdp || msg.sdp,
+  }));
+  console.log(`[mesh] ✓ Brokered connection finalized with ${msg.fromId}`);
+}
+
+// Apply a relayed ICE candidate
+async function handleBrokeredIce(msg) {
+  const entry = state.peers.find(pe => pe.id === msg.forId);
+  if (!entry) return;
+  try {
+    await entry.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+    console.log(`[mesh] ICE candidate applied for ${msg.forId}`);
+  } catch (e) {
+    console.warn(`[mesh] ICE candidate failed:`, e);
+  }
+}
+
+// A needs to forward broker messages between B and C
+function forwardBrokerMessage(fromEntry, msg) {
+  const targetEntry = state.peers.find(pe => pe.id === msg.targetId);
+  if (!targetEntry) {
+    console.warn(`[mesh] forward — no entry for target ${msg.targetId}`);
+    return;
+  }
+  if (targetEntry.dc?.readyState === 'open') {
+    // Rewrite fromId so the recipient knows who it came from
+    targetEntry.dc.send(JSON.stringify({ ...msg, brokeredBy: fromEntry.id }));
+    console.log(`[mesh] Forwarded ${msg.type} from ${fromEntry.id} → ${msg.targetId}`);
+  }
+}
+
+/* ═══════════════════════════════════════════════════ SELECTIVE MUTING */
+
+function pauseTrackToPeer(peerId, kind) {
+  const entry = state.peers.find(pe => pe.id === peerId);
+  if (!entry) return;
+  const sender = entry.pc.getSenders().find(s => s.track?.kind === kind);
+  if (sender) {
+    sender.replaceTrack(null);
+    console.log(`[mute] Paused ${kind} track to ${peerId}`);
+  }
+}
+
+function resumeTrackToPeer(peerId, kind) {
+  const entry = state.peers.find(pe => pe.id === peerId);
+  if (!entry) return;
+  const track = kind === 'video'
+    ? (state.screenStream?.getVideoTracks()[0] || state.localStream?.getVideoTracks()[0])
+    : state.localStream?.getAudioTracks()[0];
+  if (!track) return;
+  const sender = entry.pc.getSenders().find(s => s.track === null && s.track?.kind === kind)
+    || entry.pc.getSenders().find(s => {
+        // find the right kind sender even if track is null
+        const params = s.getParameters();
+        return params?.encodings && kind === 'video'
+          ? !entry.pc.getSenders().find(x => x !== s && x.track?.kind === 'audio')
+          : true;
+      });
+  // More reliable: find sender by checking transceiver direction
+  const transceiver = entry.pc.getTransceivers().find(t =>
+    t.sender === entry.pc.getSenders().find(s =>
+      (s.track?.kind === kind) || (s.track === null)
+    ) && t.receiver.track?.kind === kind
+  );
+  const correctSender = entry.pc.getSenders().find(s =>
+    s.track?.kind === kind || (s.track === null && kind === (transceiver?.receiver.track?.kind))
+  );
+  if (correctSender) {
+    correctSender.replaceTrack(track);
+    console.log(`[mute] Resumed ${kind} track to ${peerId}`);
+  }
+}
+
+// Send a mute/unmute request to a specific peer
+function sendMuteRequest(peerId, kind, mute) {
+  const entry = state.peers.find(pe => pe.id === peerId);
+  if (!entry?.dc || entry.dc.readyState !== 'open') return;
+  const type = `${mute ? 'mute' : 'unmute'}-${kind}`;
+  entry.dc.send(JSON.stringify({ type }));
+  console.log(`[mute] Sent ${type} request to ${peerId}`);
+}
+
 /* ═══════════════════════════════════════════════════ CHAT */
 function addChatMessage(role, text, name = '') {
   const msg = document.createElement('div');
@@ -1037,21 +1609,31 @@ DOM.btnClearAvatar.addEventListener('click', () => {
 
 DOM.btnSaveSettings.addEventListener('click', () => {
   const profile = {
-    name: DOM.settingsName.value.trim() || 'Anonymous',
+    name:   DOM.settingsName.value.trim() || 'Anonymous',
     avatar: state._pendingAvatar !== undefined ? state._pendingAvatar : state.profile.avatar,
   };
   saveProfile(profile);
   state._pendingAvatar = undefined;
   renderLocalProfile();
-  // Re-broadcast profile to all connected peers
-  state.peers.forEach(pe => sendProfile(pe));
+  // No re-broadcast — profile is immutable once call starts
   hideModal('settingsModal');
   toast('Profile saved!', 'success');
 });
 
 /* ═══════════════════════════════════════════════════ END CALL */
 function endCall() {
-  state.peers.forEach(pe => pe.pc.close());
+  // Notify all peers before closing
+  const leaveMsg = JSON.stringify({
+    type:   'peer-left',
+    peerId: state.localPeerId,
+    name:   state.profile.name,
+  });
+  state.peers.forEach(pe => {
+    if (pe.dc?.readyState === 'open') pe.dc.send(leaveMsg);
+    pe.pc.close();
+  });
+  state.localPeerId = null;
+
   // Remove all remote tiles
   state.peers.forEach(pe => pe.tileEl?.remove());
   state.peers.length = 0;
@@ -1072,6 +1654,7 @@ function endCall() {
   // Clear URL hash
   history.replaceState(null, '', location.pathname);
   refreshGridClass();
+  unlockSettings();
   showSplash();
 }
 
@@ -1121,6 +1704,7 @@ function showJoinSpinner(roomId) {
 
   const listener = ntfyListen(roomId, 'offer', async (offerData) => {
     hideModal('signalingModal');
+    lockSettingsDuringCall();
     await startLocalMedia();
     showCallScreen();
     await joinCall(offerData, roomId);
@@ -1138,15 +1722,15 @@ function showJoinSpinner(roomId) {
 /* ═══════════════════════════════════════════════════ EVENT WIRING */
 
 // Splash
-DOM.btnInitiate.onclick = async () => {
-  await initiateCall(false);
+DOM.btnInitiate.onclick = () => {
+  checkProfileBeforeCall(() => initiateCall(false));
 };
 
-DOM.btnJoinFromSplash.onclick = async () => {
-  // Show a "join" modal to paste offer
-  await startLocalMedia();
-  showCallScreen();
-  openJoinModal();
+DOM.btnJoinFromSplash.onclick = () => {
+  checkProfileBeforeCall(async () => {
+    showCallScreen();
+    openJoinModal();
+  });
 };
 
 function openJoinModal() {
@@ -1170,6 +1754,7 @@ function openJoinModal() {
   };
 }
 
+DOM.btnToggleSignaling.onclick = toggleSignalingModal;
 // Topbar
 DOM.btnAddPeer.onclick = () => initiateCall(true);
 DOM.btnEndCall.onclick = () => { if (confirm('End the call?')) endCall(); };

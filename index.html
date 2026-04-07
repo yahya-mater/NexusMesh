@@ -75,29 +75,69 @@
   </header>
 
   <!-- Video grid -->
-  <main class="video-grid" id="videoGrid">
-    <!-- Local tile -->
-    <div class="video-tile local-tile" id="localTile">
-      <video id="localVideo" autoplay muted playsinline></video>
-      <div class="tile-overlay">
-        <div class="peer-info" id="localInfo">
-          <span class="peer-avatar" id="localAvatar">?</span>
-          <span class="peer-name" id="localName">You</span>
+  <!-- Call area: spotlight + peer strip -->
+  <main class="call-area" id="callArea">
+
+    <!-- Spotlight -->
+    <div class="spotlight is-cam" id="spotlight">
+      <video id="spotlightVideo" autoplay playsinline muted></video>
+      <div class="spotlight-overlay">
+        <div class="top-row">
+          <div class="spotlight-badge" id="spotlightBadge">
+            <span class="peer-avatar" id="spotlightAvatar">?</span>
+            <span id="spotlightName">You</span>
+            <div class="quality-indicator" id="spotlightQuality" style="display:none;">
+              <div class="quality-bar"></div>
+              <div class="quality-bar"></div>
+              <div class="quality-bar"></div>
+            </div>
+          </div>
+          <span class="screen-share-badge" id="spotlightScreenBadge" style="display:none;">
+            ⬡ SCREEN
+          </span>
         </div>
-        <div class="tile-controls">
-          <button class="tile-btn" id="btnMuteAudio" title="Mute mic">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8"/></svg>
-          </button>
-          <button class="tile-btn" id="btnHideVideo" title="Hide camera">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 1l22 22M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><path d="M14.12 14.12a3 3 0 11-4.24-4.24"/></svg>
+        <div class="bottom-row">
+          <button class="unpin-btn" id="btnUnpin" style="display:none;">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 3l6 6-9.5 9.5-1-4-4.5-1L15 3zM3 21l4.5-4.5"/></svg>
+            Unpin
           </button>
         </div>
       </div>
-      <div class="no-cam-placeholder" id="localNoCam">
-        <span class="placeholder-avatar" id="localPlaceholderAvatar">?</span>
+      <div class="spotlight-empty" id="spotlightEmpty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <p>No one pinned yet</p>
       </div>
     </div>
-    <!-- Remote tiles injected here -->
+
+    <!-- Peer strip (sidebar on desktop, bottom on mobile) -->
+    <div class="peer-strip" id="peerStrip">
+      <!-- Local PIP tile always first in strip -->
+      <div class="strip-tile local-strip" id="localStripTile">
+        <video id="localVideo" autoplay muted playsinline></video>
+        <div class="strip-no-cam" id="localNoCam">
+          <div class="strip-no-cam-avatar" id="localPlaceholderAvatar">?</div>
+        </div>
+        <div class="strip-tile-overlay">
+          <div class="strip-tile-name">
+            <span class="mini-avatar" id="localMiniAvatar">?</span>
+            <span id="localName">You</span>
+          </div>
+        </div>
+        <div class="strip-tile-controls">
+          <button class="strip-btn" id="btnMuteAudio" title="Mute mic">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8"/></svg>
+          </button>
+          <button class="strip-btn" id="btnHideVideo" title="Hide camera">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 1l22 22M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19"/><path d="M14.12 14.12a3 3 0 11-4.24-4.24"/></svg>
+          </button>
+          <button class="strip-btn" id="btnPinLocal" title="Pin to spotlight">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 3l6 6-9.5 9.5-1-4-4.5-1L15 3zM3 21l4.5-4.5"/></svg>
+          </button>
+        </div>
+      </div>
+      <!-- Remote strip tiles injected here -->
+    </div>
+
   </main>
 
   <!-- Chat panel -->

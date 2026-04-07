@@ -51,6 +51,10 @@ const state = {
     _manualPeerId:  null,
     _countdownTimer: null,
   },
+  spotlight: {
+    pinnedId:   null,   // stableId of pinned peer, or 'local', or null
+    autoId:     null,   // stableId auto-promoted (screen share)
+  },
 };
 
 /*
@@ -73,24 +77,32 @@ const $ = id => document.getElementById(id);
 const DOM = {
   splash:          $('splash'),
   callScreen:      $('callScreen'),
-  videoGrid:       $('videoGrid'),
+  callArea:        $('callArea'),
+  peerStrip:       $('peerStrip'),
+  spotlight:       $('spotlight'),
+  spotlightVideo:  $('spotlightVideo'),
+  spotlightName:   $('spotlightName'),
+  spotlightAvatar: $('spotlightAvatar'),
+  spotlightBadge:  $('spotlightBadge'),
+  spotlightQuality:$('spotlightQuality'),
+  spotlightScreenBadge: $('spotlightScreenBadge'),
+  spotlightEmpty:  $('spotlightEmpty'),
+  btnUnpin:        $('btnUnpin'),
+  btnPinLocal:     $('btnPinLocal'),
+  localStripTile:  $('localStripTile'),
   localVideo:      $('localVideo'),
-  localTile:       $('localTile'),
   localName:       $('localName'),
-  localAvatar:     $('localAvatar'),
+  localMiniAvatar: $('localMiniAvatar'),
   localNoCam:      $('localNoCam'),
   localPlaceholderAvatar: $('localPlaceholderAvatar'),
   globalDot:       $('globalStatusDot'),
   globalLabel:     $('globalStatusLabel'),
-  // Topbar
   btnInitiate:     $('btnInitiate'),
   btnJoinFromSplash: $('btnJoinFromSplash'),
   btnAddPeer:      $('btnAddPeer'),
   btnEndCall:      $('btnEndCall'),
-  // Media
   btnMuteAudio:    $('btnMuteAudio'),
   btnHideVideo:    $('btnHideVideo'),
-  // Chat
   chatPanel:       $('chatPanel'),
   chatMessages:    $('chatMessages'),
   chatInput:       $('chatInput'),
@@ -98,15 +110,12 @@ const DOM = {
   btnToggleChat:   $('btnToggleChat'),
   btnCloseChat:    $('btnCloseChat'),
   chatBadge:       $('chatBadge'),
-  // Screen share
   btnShareScreen:  $('btnShareScreen'),
-  // Signaling modal
   signalingModal:  $('signalingModal'),
   signalingTitle:  $('signalingTitle'),
   signalingBody:   $('signalingBody'),
-  btnCloseSignaling:   $('btnCloseSignaling'),
-  btnToggleSignaling:  $('btnToggleSignaling'),
-  // Settings modal
+  btnCloseSignaling: $('btnCloseSignaling'),
+  btnToggleSignaling: $('btnToggleSignaling'),
   settingsModal:   $('settingsModal'),
   settingsName:    $('settingsName'),
   avatarPreview:   $('avatarPreview'),
@@ -118,6 +127,169 @@ const DOM = {
   btnCloseSettings: $('btnCloseSettings'),
   toastContainer:  $('toastContainer'),
 };
+
+/* ═══════════════════════════════════════════════════ SPOTLIGHT ENGINE */
+
+function refreshSpotlight() {
+  const pinned = state.spotlight.pinnedId;
+  const auto   = state.spotlight.autoId;
+  const activeId = pinned || auto;
+
+  if (!activeId) {
+    // No one spotlighted — show empty state, hide unpin
+    DOM.spotlightVideo.srcObject = null;
+    DOM.spotlightEmpty.style.display = 'flex';
+    DOM.btnUnpin.style.display = 'none';
+    DOM.spotlightScreenBadge.style.display = 'none';
+    DOM.spotlightName.textContent = '';
+    setAvatarEl(DOM.spotlightAvatar, '', '');
+    return;
+  }
+
+  DOM.spotlightEmpty.style.display = 'none';
+  DOM.btnUnpin.style.display = pinned ? 'flex' : 'none';
+
+  if (activeId === 'local') {
+    // Local feed in spotlight
+    DOM.spotlightVideo.srcObject = state.screenStream || state.localStream;
+    DOM.spotlight.classList.toggle('is-cam', !state.screenStream);
+    DOM.spotlightName.textContent = state.profile.name || 'You';
+    setAvatarEl(DOM.spotlightAvatar, state.profile.avatar, state.profile.name);
+    DOM.spotlightScreenBadge.style.display = state.screenStream ? 'flex' : 'none';
+    DOM.spotlightQuality.style.display = 'none';
+    return;
+  }
+
+  const entry = state.peers.find(pe => pe.stableId === activeId || pe.id === activeId);
+  if (!entry) { clearSpotlight(); return; }
+
+  DOM.spotlightVideo.srcObject = entry.remoteStream;
+  DOM.spotlight.classList.remove('is-cam');
+  DOM.spotlightName.textContent = entry.info?.name || 'Peer';
+  setAvatarEl(DOM.spotlightAvatar, entry.info?.avatar, entry.info?.name);
+  DOM.spotlightScreenBadge.style.display = entry.isSharingScreen ? 'flex' : 'none';
+  DOM.spotlightQuality.style.display = 'flex';
+}
+
+function pinPeer(id) {
+  state.spotlight.pinnedId = id;
+  // Mark pinned state on strip tiles
+  document.querySelectorAll('.strip-tile').forEach(t => {
+    t.classList.toggle('pinned', t.dataset.peerId === id || (id === 'local' && t.id === 'localStripTile'));
+  });
+  refreshSpotlight();
+  console.log(`[spotlight] Pinned: ${id}`);
+}
+
+function unpinPeer() {
+  state.spotlight.pinnedId = null;
+  document.querySelectorAll('.strip-tile').forEach(t => t.classList.remove('pinned'));
+  refreshSpotlight();
+  console.log('[spotlight] Unpinned');
+}
+
+function clearSpotlight() {
+  state.spotlight.pinnedId = null;
+  state.spotlight.autoId   = null;
+  document.querySelectorAll('.strip-tile').forEach(t => t.classList.remove('pinned'));
+  refreshSpotlight();
+}
+
+function autoPromoteScreenShare(entry, isSharing) {
+  entry.isSharingScreen = isSharing;
+  const tile = entry.tileEl;
+  if (tile) {
+    tile.classList.toggle('screen-sharing', isSharing);
+    const badge = tile.querySelector('.strip-screen-badge');
+    if (badge) badge.style.display = isSharing ? 'block' : 'none';
+  }
+  if (isSharing && !state.spotlight.pinnedId) {
+    state.spotlight.autoId = entry.stableId || entry.id;
+    refreshSpotlight();
+  } else if (!isSharing && state.spotlight.autoId === (entry.stableId || entry.id)) {
+    state.spotlight.autoId = null;
+    refreshSpotlight();
+  }
+}
+
+// Speaking detection via Web Audio
+const speakingAnalysers = new Map(); // peerId → { analyser, source, interval }
+
+function startSpeakingDetection(entry) {
+  if (speakingAnalysers.has(entry.id)) return;
+  try {
+    const ctx      = new AudioContext();
+    const source   = ctx.createMediaStreamSource(entry.remoteStream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    const interval = setInterval(() => {
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      const speaking = avg > 12;
+      entry.tileEl?.classList.toggle('speaking', speaking);
+      // If spotlighted, add speaking ring to spotlight too
+      if ((state.spotlight.pinnedId || state.spotlight.autoId) === (entry.stableId || entry.id)) {
+        DOM.spotlight.classList.toggle('speaking', speaking);
+      }
+    }, 200);
+
+    speakingAnalysers.set(entry.id, { ctx, interval });
+  } catch { /* AudioContext unavailable */ }
+}
+
+function stopSpeakingDetection(id) {
+  const handle = speakingAnalysers.get(id);
+  if (!handle) return;
+  clearInterval(handle.interval);
+  handle.ctx.close().catch(() => {});
+  speakingAnalysers.delete(id);
+}
+
+// Connection quality from RTCPeerConnection.getStats()
+async function updateQuality(entry) {
+  if (!entry.pc || entry.status !== 'connected') return;
+  try {
+    const stats = await entry.pc.getStats();
+    let rtt = null, lost = 0, sent = 0;
+    stats.forEach(r => {
+      if (r.type === 'remote-inbound-rtp' && r.kind === 'video') {
+        rtt  = r.roundTripTime;
+        lost = r.packetsLost || 0;
+        sent = r.packetsSent || 1;
+      }
+    });
+    const lossRate = lost / sent;
+    // 0=good 1=ok 2=poor
+    const level = rtt === null ? 0 : rtt > .3 || lossRate > .05 ? 2 : rtt > .15 || lossRate > .02 ? 1 : 0;
+    updateQualityBars(entry, level);
+  } catch {}
+}
+
+function updateQualityBars(entry, level) {
+  // Update strip tile quality if we add it later
+  // Update spotlight quality if this peer is spotlighted
+  const id = entry.stableId || entry.id;
+  if ((state.spotlight.pinnedId || state.spotlight.autoId) !== id) return;
+  const bars = DOM.spotlightQuality.querySelectorAll('.quality-bar');
+  bars.forEach((b, i) => {
+    b.classList.remove('active', 'warn', 'poor');
+    if (i <= (2 - level)) {
+      b.classList.add('active');
+      if (level === 1) b.classList.add('warn');
+      if (level === 2) b.classList.add('poor');
+    }
+  });
+}
+
+// Poll quality every 5 seconds for connected peers
+setInterval(() => {
+  state.peers.forEach(pe => {
+    if (pe.status === 'connected') updateQuality(pe);
+  });
+}, 5000);
 
 /* ═══════════════════════════════════════════════════ UTILS */
 
@@ -882,8 +1054,10 @@ function unlockSettings() {
 function renderLocalProfile() {
   const p = state.profile;
   DOM.localName.textContent = p.name || 'You';
-  setAvatarEl(DOM.localAvatar, p.avatar, p.name);
+  setAvatarEl(DOM.localMiniAvatar, p.avatar, p.name);
   setAvatarEl(DOM.localPlaceholderAvatar, p.avatar, p.name);
+  // Refresh spotlight if local is pinned
+  if (state.spotlight.pinnedId === 'local') refreshSpotlight();
 }
 
 function setAvatarEl(el, avatar, name) {
@@ -986,7 +1160,11 @@ async function toggleScreenShare() {
           if (sender) sender.replaceTrack(camTrack).catch(() => {});
         });
         DOM.localVideo.srcObject = state.localStream;
-        setLocalVideoMirror(true);   // back to cam — restore mirror
+        setLocalVideoMirror(true);
+        DOM.localStripTile.classList.remove('screen-sharing');
+        if (state.spotlight.pinnedId === 'local' || state.spotlight.autoId === 'local') {
+          refreshSpotlight();
+        }
       }
     }
     return;
@@ -997,7 +1175,12 @@ async function toggleScreenShare() {
     DOM.btnShareScreen.classList.add('active');
     const screenTrack = ss.getVideoTracks()[0];
     DOM.localVideo.srcObject = ss;
-    setLocalVideoMirror(false);  // screen share should never be mirrored
+    setLocalVideoMirror(false);
+    DOM.localStripTile.classList.add('screen-sharing');
+    if (!state.spotlight.pinnedId) {
+      state.spotlight.autoId = 'local';
+      refreshSpotlight();
+    }
     state.peers.forEach(pe => {
       const sender = pe.pc.getSenders().find(s => s.track?.kind === 'video');
       if (sender) sender.replaceTrack(screenTrack).catch(() => {});
@@ -1074,7 +1257,7 @@ function attachPeerTile(entry) {
   entry.tileAttached = true;
   console.log(`[tile] Attaching tile for peer ${entry.id}`);
   addRemoteTile(entry);
-  refreshGridClass();
+  refreshLayout();
 }
 
 function setupDataChannel(entry) {
@@ -1269,87 +1452,111 @@ function broadcastChat(text) {
 /* ═══════════════════════════════════════════════════ TILE MANAGEMENT */
 function addRemoteTile(entry) {
   const tile = document.createElement('div');
-  tile.className = 'video-tile remote-tile';
-  tile.dataset.peerId = entry.id;
+  tile.className = 'strip-tile';
+  tile.dataset.peerId = entry.stableId || entry.id;
 
   const video = document.createElement('video');
-  video.autoplay = true;
-  video.playsInline = true;
+  video.autoplay = true; video.playsInline = true;
   video.srcObject = entry.remoteStream;
 
+  const noCam = document.createElement('div');
+  noCam.className = 'strip-no-cam';
+  noCam.innerHTML = `<div class="strip-no-cam-avatar" data-placeholder-for="${entry.id}">?</div>`;
+
   const statusBadge = document.createElement('div');
-  statusBadge.className = 'peer-conn-status';
+  statusBadge.className = 'strip-conn-status';
   statusBadge.textContent = 'Connecting…';
 
   const overlay = document.createElement('div');
-  overlay.className = 'tile-overlay';
+  overlay.className = 'strip-tile-overlay';
+  overlay.innerHTML = `
+    <div class="strip-tile-name">
+      <span class="mini-avatar" data-avatar-for="${entry.id}">?</span>
+      <span data-name-for="${entry.id}">Connecting…</span>
+    </div>`;
 
-  const peerInfo = document.createElement('div');
-  peerInfo.className = 'peer-info';
-  peerInfo.innerHTML = `
-    <span class="peer-avatar" data-avatar-for="${entry.id}">?</span>
-    <span class="peer-name" data-name-for="${entry.id}">Connecting…</span>`;
+  const screenBadge = document.createElement('div');
+  screenBadge.className = 'strip-screen-badge';
+  screenBadge.textContent = 'SCREEN';
+  screenBadge.style.display = 'none';
 
-  // Per-peer selective mute controls
-  const peerControls = document.createElement('div');
-  peerControls.className = 'tile-controls';
+  // Per-peer controls
+  const controls = document.createElement('div');
+  controls.className = 'strip-tile-controls';
 
-  const muteCamBtn = document.createElement('button');
-  muteCamBtn.className = 'tile-btn';
-  muteCamBtn.title = "Stop receiving their video";
-  muteCamBtn.dataset.muteVideo = 'false';
-  muteCamBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>`;
-  muteCamBtn.onclick = () => {
-    const isMuted = muteCamBtn.dataset.muteVideo === 'true';
-    const next = !isMuted;
-    muteCamBtn.dataset.muteVideo = String(next);
-    muteCamBtn.classList.toggle('muted', next);
-    muteCamBtn.title = next ? 'Resume their video' : 'Stop receiving their video';
-    // Tell that peer to stop/resume sending video to us
+  // Pin button
+  const pinBtn = document.createElement('button');
+  pinBtn.className = 'strip-btn';
+  pinBtn.title = 'Pin to spotlight';
+  pinBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15 3l6 6-9.5 9.5-1-4-4.5-1L15 3zM3 21l4.5-4.5"/></svg>`;
+  pinBtn.onclick = e => {
+    e.stopPropagation();
+    const id = entry.stableId || entry.id;
+    if (state.spotlight.pinnedId === id) unpinPeer();
+    else pinPeer(id);
+  };
+
+  // Mute video button
+  const muteVidBtn = document.createElement('button');
+  muteVidBtn.className = 'strip-btn';
+  muteVidBtn.title = 'Stop their video';
+  muteVidBtn.dataset.muteVideo = 'false';
+  muteVidBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>`;
+  muteVidBtn.onclick = e => {
+    e.stopPropagation();
+    const next = muteVidBtn.dataset.muteVideo !== 'true';
+    muteVidBtn.dataset.muteVideo = String(next);
+    muteVidBtn.classList.toggle('active', next);
+    muteVidBtn.title = next ? 'Resume their video' : 'Stop their video';
     sendMuteRequest(entry.id, 'video', next);
-    // Visually hide their video tile
     if (entry.videoEl) entry.videoEl.style.visibility = next ? 'hidden' : 'visible';
-    console.log(`[mute] ${next ? 'Muted' : 'Unmuted'} video from ${entry.id}`);
   };
 
-  const muteAudioBtn = document.createElement('button');
-  muteAudioBtn.className = 'tile-btn';
-  muteAudioBtn.title = "Stop receiving their audio";
-  muteAudioBtn.dataset.muteAudio = 'false';
-  muteAudioBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8"/></svg>`;
-  muteAudioBtn.onclick = () => {
-    const isMuted = muteAudioBtn.dataset.muteAudio === 'true';
-    const next = !isMuted;
-    muteAudioBtn.dataset.muteAudio = String(next);
-    muteAudioBtn.classList.toggle('muted', next);
-    muteAudioBtn.title = next ? 'Resume their audio' : 'Stop receiving their audio';
+  // Mute audio button
+  const muteAudBtn = document.createElement('button');
+  muteAudBtn.className = 'strip-btn';
+  muteAudBtn.title = 'Mute their audio';
+  muteAudBtn.dataset.muteAudio = 'false';
+  muteAudBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8"/></svg>`;
+  muteAudBtn.onclick = e => {
+    e.stopPropagation();
+    const next = muteAudBtn.dataset.muteAudio !== 'true';
+    muteAudBtn.dataset.muteAudio = String(next);
+    muteAudBtn.classList.toggle('active', next);
+    muteAudBtn.title = next ? 'Unmute their audio' : 'Mute their audio';
     sendMuteRequest(entry.id, 'audio', next);
-    // Locally mute their audio track in the video element
     if (entry.videoEl) entry.videoEl.muted = next;
-    console.log(`[mute] ${next ? 'Muted' : 'Unmuted'} audio from ${entry.id}`);
   };
 
-  peerControls.appendChild(muteCamBtn);
-  peerControls.appendChild(muteAudioBtn);
-  overlay.appendChild(peerControls);
-  overlay.appendChild(peerInfo);
+  controls.append(pinBtn, muteVidBtn, muteAudBtn);
 
-  tile.appendChild(video);
-  tile.appendChild(statusBadge);
-  tile.appendChild(overlay);
+  // Click tile to pin
+  tile.onclick = () => {
+    const id = entry.stableId || entry.id;
+    if (state.spotlight.pinnedId === id) unpinPeer();
+    else pinPeer(id);
+  };
 
-  DOM.videoGrid.appendChild(tile);
-  entry.videoEl = video;
+  tile.append(video, noCam, statusBadge, overlay, screenBadge, controls);
+  DOM.peerStrip.appendChild(tile);
+
+  entry.videoEl  = video;
   entry.statusEl = statusBadge;
-  entry.tileEl = tile;
+  entry.tileEl   = tile;
+  entry.noCamEl  = noCam;
+
+  // Start speaking detection once remote stream has audio
+  entry.remoteStream.onaddtrack = () => {
+    if (entry.remoteStream.getAudioTracks().length > 0) {
+      startSpeakingDetection(entry);
+    }
+  };
 }
 
-function refreshGridClass() {
-  const count = state.peers.length;
-  DOM.videoGrid.className = 'video-grid';
-  if (count === 1) DOM.videoGrid.classList.add('peers-1');
-  else if (count === 2) DOM.videoGrid.classList.add('peers-2');
-  else if (count >= 3) DOM.videoGrid.classList.add('peers-3');
+function refreshLayout() {
+  // If no peers, hide strip (just local tile stays)
+  // Strip is always visible — layout engine is CSS flex
+  refreshSpotlight();
 }
 
 function updatePeerTileStatus(entry) {
@@ -1359,16 +1566,23 @@ function updatePeerTileStatus(entry) {
     disconnected: 'Reconnecting…', failed: 'Failed', closed: 'Closed',
   };
   entry.statusEl.textContent = labels[entry.status] || entry.status;
-  entry.statusEl.style.color = entry.status === 'connected' ? '#00e676' :
+  entry.statusEl.style.color = entry.status === 'connected' ? 'var(--success)' :
     entry.status === 'failed' ? 'var(--danger)' : 'var(--txt-2)';
+  // Hide status badge once connected
+  if (entry.statusEl) {
+    entry.statusEl.style.display = entry.status === 'connected' ? 'none' : 'block';
+  }
 }
 
 function updatePeerTileInfo(entry) {
   if (!entry.info) return;
-  const nameEl = entry.tileEl?.querySelector(`[data-name-for="${entry.id}"]`);
+  const nameEl   = entry.tileEl?.querySelector(`[data-name-for="${entry.id}"]`);
   const avatarEl = entry.tileEl?.querySelector(`[data-avatar-for="${entry.id}"]`);
-  if (nameEl) nameEl.textContent = entry.info.name;
+  if (nameEl)   nameEl.textContent = entry.info.name;
   if (avatarEl) setAvatarEl(avatarEl, entry.info.avatar, entry.info.name);
+  // Refresh spotlight if this peer is spotlighted
+  const id = entry.stableId || entry.id;
+  if ((state.spotlight.pinnedId || state.spotlight.autoId) === id) refreshSpotlight();
 }
 
 function updateGlobalStatus() {
@@ -1387,8 +1601,12 @@ function removePeer(id) {
   const entry = state.peers[idx];
   entry.pc.close();
   entry.tileEl?.remove();
+  stopSpeakingDetection(entry.id);
+  const id = entry.stableId || entry.id;
+  if (state.spotlight.pinnedId === id) unpinPeer();
+  if (state.spotlight.autoId   === id) { state.spotlight.autoId = null; refreshSpotlight(); }
   state.peers.splice(idx, 1);
-  refreshGridClass();
+  refreshLayout();
   updateGlobalStatus();
 }
 
@@ -2142,6 +2360,7 @@ DOM.btnSaveSettings.addEventListener('click', () => {
   toast('Profile saved!', 'success');
 });
 
+
 /* ═══════════════════════════════════════════════════ END CALL */
 function endCall() {
   // Notify all peers before closing
@@ -2176,7 +2395,7 @@ function endCall() {
   // Clear URL hash
   stopRoom();
   history.replaceState(null, '', location.pathname);
-  refreshGridClass();
+  refreshLayout();
   unlockSettings();
   showSplash();
 }
@@ -2318,6 +2537,18 @@ DOM.chatInput.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preve
 // Modal close buttons
 DOM.btnCloseSignaling.onclick = () => hideModal('signalingModal');
 DOM.btnCloseSettings.onclick = () => hideModal('settingsModal');
+
+// Spotlight controls
+DOM.btnUnpin.onclick  = unpinPeer;
+DOM.btnPinLocal.onclick = () => {
+  if (state.spotlight.pinnedId === 'local') unpinPeer();
+  else pinPeer('local');
+};
+DOM.localStripTile.onclick = e => {
+  if (e.target.closest('.strip-btn')) return; // don't pin when clicking control buttons
+  if (state.spotlight.pinnedId === 'local') unpinPeer();
+  else pinPeer('local');
+};
 
 // Close modals on overlay click
 document.querySelectorAll('.modal-overlay').forEach(overlay => {

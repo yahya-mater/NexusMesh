@@ -1602,7 +1602,7 @@ function removePeer(id) {
   entry.pc.close();
   entry.tileEl?.remove();
   stopSpeakingDetection(entry.id);
-  const id = entry.stableId || entry.id;
+  id = entry.stableId || entry.id;
   if (state.spotlight.pinnedId === id) unpinPeer();
   if (state.spotlight.autoId   === id) { state.spotlight.autoId = null; refreshSpotlight(); }
   state.peers.splice(idx, 1);

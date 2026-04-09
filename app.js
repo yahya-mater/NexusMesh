@@ -225,16 +225,38 @@ function startSpeakingDetection(entry) {
     source.connect(analyser);
     const data = new Uint8Array(analyser.frequencyBinCount);
 
+    let speakingFrames = 0;
+    const SPEAK_ON_THRESHOLD  = 3;  // frames above level before "speaking"
+    const SPEAK_OFF_THRESHOLD = 6;  // frames below level before "silent"
+    let isSpeaking = false;
+
     const interval = setInterval(() => {
       analyser.getByteFrequencyData(data);
       const avg = data.reduce((a, b) => a + b, 0) / data.length;
-      const speaking = avg > 12;
-      entry.tileEl?.classList.toggle('speaking', speaking);
-      // If spotlighted, add speaking ring to spotlight too
-      if ((state.spotlight.pinnedId || state.spotlight.autoId) === (entry.stableId || entry.id)) {
-        DOM.spotlight.classList.toggle('speaking', speaking);
+      const loud = avg > 14;
+
+      if (loud) {
+        speakingFrames = Math.min(speakingFrames + 1, SPEAK_ON_THRESHOLD + 2);
+      } else {
+        speakingFrames = Math.max(speakingFrames - 1, 0);
       }
-    }, 200);
+
+      const shouldSpeak = speakingFrames >= SPEAK_ON_THRESHOLD;
+      const shouldSilence = speakingFrames === 0;
+
+      if (shouldSpeak && !isSpeaking) {
+        isSpeaking = true;
+        entry.tileEl?.classList.add('speaking');
+        const id = entry.stableId || entry.id;
+        if ((state.spotlight.pinnedId || state.spotlight.autoId) === id) {
+          DOM.spotlight.classList.add('speaking');
+        }
+      } else if (shouldSilence && isSpeaking) {
+        isSpeaking = false;
+        entry.tileEl?.classList.remove('speaking');
+        DOM.spotlight.classList.remove('speaking');
+      }
+    }, 150);
 
     speakingAnalysers.set(entry.id, { ctx, interval });
   } catch { /* AudioContext unavailable */ }
@@ -1122,6 +1144,7 @@ function toggleMute() {
   state.isMuted = !state.isMuted;
   state.localStream.getAudioTracks().forEach(t => (t.enabled = !state.isMuted));
   DOM.btnMuteAudio.classList.toggle('muted', state.isMuted);
+  broadcastSelfState();
   DOM.btnMuteAudio.title = state.isMuted ? 'Unmute mic' : 'Mute mic';
   // Update SVG icon
   DOM.btnMuteAudio.innerHTML = state.isMuted
@@ -1135,6 +1158,7 @@ function toggleVideo() {
   state.localStream.getVideoTracks().forEach(t => (t.enabled = !state.isHidden));
   DOM.btnHideVideo.classList.toggle('hidden-cam', state.isHidden);
   DOM.localNoCam.classList.toggle('visible', state.isHidden);
+  broadcastSelfState();
   DOM.btnHideVideo.title = state.isHidden ? 'Show camera' : 'Hide camera';
 }
 
@@ -1160,7 +1184,7 @@ async function toggleScreenShare() {
           if (sender) sender.replaceTrack(camTrack).catch(() => {});
         });
         DOM.localVideo.srcObject = state.localStream;
-        setLocalVideoMirror(true);
+        setLocalVideoMirror(false);//true);
         DOM.localStripTile.classList.remove('screen-sharing');
         if (state.spotlight.pinnedId === 'local' || state.spotlight.autoId === 'local') {
           refreshSpotlight();
@@ -1264,13 +1288,19 @@ function setupDataChannel(entry) {
   const dc = entry.dc;
   dc.onopen = () => {
     console.log(`[${entry.id}] DataChannel open`);
-    // Send identity first, then profile
     dc.send(JSON.stringify({
       type:     'identity',
       stableId: state.localPeerId,
       name:     state.profile.name,
     }));
     sendProfile(entry);
+    // Send our current mute/video state immediately
+    dc.send(JSON.stringify({
+      type:       'self-state',
+      audioMuted: state.isMuted,
+      videoOff:   state.isHidden,
+      stableId:   state.localPeerId,
+    }));
   };
   dc.onmessage = e => {
     try {
@@ -1300,6 +1330,13 @@ function handleDataMessage(entry, msg) {
       // Store the remote peer's stable ID — this is what we use for brokering
       entry.stableId = msg.stableId;
       console.log(`[mesh] identity registered — connection ${entry.id} = stable ${msg.stableId}`);
+      break;
+
+    case 'self-state':
+      entry.peerMutedAudio = msg.audioMuted;
+      entry.peerVideoOff   = msg.videoOff;
+      console.log(`[state] Peer ${entry.id} — muted: ${msg.audioMuted}, videoOff: ${msg.videoOff}`);
+      updatePeerCardState(entry);
       break;
 
     case 'profile':
@@ -1432,6 +1469,22 @@ function handleDataMessage(entry, msg) {
   }
 }
 
+function broadcastSelfState() {
+  const payload = JSON.stringify({
+    type:       'self-state',
+    audioMuted: state.isMuted,
+    videoOff:   state.isHidden,
+    stableId:   state.localPeerId,
+  });
+  state.peers.forEach(pe => {
+    if (pe.dc?.readyState === 'open') pe.dc.send(payload);
+  });
+  console.log(`[state] Broadcast self-state — muted: ${state.isMuted}, videoOff: ${state.isHidden}`);
+}
+
+// Also send self-state when a new DC opens so the peer gets our current state immediately
+// Called from setupDataChannel dc.onopen — see below
+
 const seenMsgIds = new Set();
 
 function broadcastChat(text) {
@@ -1477,7 +1530,7 @@ function addRemoteTile(entry) {
 
   const screenBadge = document.createElement('div');
   screenBadge.className = 'strip-screen-badge';
-  screenBadge.textContent = 'SCREEN';
+  screenBadge.textContent = 'LIVE';
   screenBadge.style.display = 'none';
 
   // Per-peer controls
@@ -1559,6 +1612,40 @@ function refreshLayout() {
   refreshSpotlight();
 }
 
+function updatePeerCardState(entry) {
+  if (!entry.tileEl) return;
+
+  // Muted audio indicator
+  let mutedIcon = entry.tileEl.querySelector('.peer-muted-icon');
+  if (entry.peerMutedAudio) {
+    if (!mutedIcon) {
+      mutedIcon = document.createElement('div');
+      mutedIcon.className = 'peer-muted-icon';
+      mutedIcon.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="1" y1="1" x2="23" y2="23"/>
+          <path d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6"/>
+          <path d="M17 16.95A7 7 0 015 12v-2m14 0v2a7 7 0 01-.11 1.23M12 19v4m-4 0h8"/>
+        </svg>`;
+      entry.tileEl.appendChild(mutedIcon);
+    }
+  } else {
+    mutedIcon?.remove();
+  }
+
+  // Video off — show no-cam placeholder
+  if (entry.noCamEl) {
+    entry.noCamEl.classList.toggle('visible', !!entry.peerVideoOff);
+  }
+
+  // Dim name if muted
+  const nameEl = entry.tileEl.querySelector('[data-name-for]');
+  if (nameEl) nameEl.style.opacity = entry.peerMutedAudio ? '.55' : '1';
+
+  // Update strip tile class for video state
+  entry.tileEl.classList.toggle('video-off', !!entry.peerVideoOff);
+}
+
 function updatePeerTileStatus(entry) {
   if (!entry.statusEl) return;
   const labels = {
@@ -1572,6 +1659,7 @@ function updatePeerTileStatus(entry) {
   if (entry.statusEl) {
     entry.statusEl.style.display = entry.status === 'connected' ? 'none' : 'block';
   }
+  entry.tileEl?.classList.toggle('is-connecting', entry.status === 'connecting' || entry.status === 'new');
 }
 
 function updatePeerTileInfo(entry) {
@@ -2556,6 +2644,43 @@ document.querySelectorAll('.modal-overlay').forEach(overlay => {
     if (e.target === overlay) overlay.classList.remove('open');
   });
 });
+
+/* ═══════════════════════════════════════════════════ AUTO-HIDE CONTROLS */
+(function setupAutoHide() {
+  let hideTimer = null;
+  let hidden = false;
+  const HIDE_DELAY = 3500; // ms of inactivity before hiding
+
+  function showControls() {
+    if (!hidden) return;
+    hidden = false;
+    document.querySelector('.callbar')?.classList.remove('autohide');
+    document.querySelector('.topbar')?.classList.remove('autohide');
+  }
+
+  function scheduleHide() {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      // Only auto-hide when in a call with at least one connected peer
+      const inCall = DOM.callScreen.classList.contains('active');
+      const hasPeers = state.peers.some(p => p.status === 'connected');
+      if (!inCall || !hasPeers) return;
+      hidden = true;
+      document.querySelector('.callbar')?.classList.add('autohide');
+      document.querySelector('.topbar')?.classList.add('autohide');
+    }, HIDE_DELAY);
+  }
+
+  // Any mouse movement or touch resets the timer
+  document.addEventListener('mousemove', () => { showControls(); scheduleHide(); });
+  document.addEventListener('touchstart', () => { showControls(); scheduleHide(); });
+
+  // Clicking the call area also resets
+  document.addEventListener('click', () => { showControls(); scheduleHide(); });
+
+  // Keyboard activity
+  document.addEventListener('keydown', () => { showControls(); scheduleHide(); });
+})();
 
 /* ═══════════════════════════════════════════════════ BOOT */
 (function init() {

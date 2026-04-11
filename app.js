@@ -52,9 +52,10 @@ const state = {
     _countdownTimer: null,
   },
   spotlight: {
-    pinnedId:   null,   // stableId of pinned peer, or 'local', or null
-    autoId:     null,   // stableId auto-promoted (screen share)
+    pinnedId:   null,
+    autoId:     null,
   },
+  layout: 'grid',
 };
 
 /*
@@ -128,88 +129,259 @@ const DOM = {
   toastContainer:  $('toastContainer'),
 };
 
-/* ═══════════════════════════════════════════════════ SPOTLIGHT ENGINE */
+/* ═══════════════════════════════════════════════════ LAYOUT ENGINE */
 
+function getLayoutMode() {
+  const hasPinned     = !!state.spotlight.pinnedId;
+  const hasAutoPromote = !!state.spotlight.autoId;
+  const peerCount     = state.peers.filter(p => p.tileAttached).length;
+  // Spotlight mode when: something pinned, screen share active, or 5+ peers
+  if (hasPinned || hasAutoPromote || peerCount >= 4) return 'spotlight';
+  return 'grid';
+}
+
+function refreshLayout() {
+  const mode     = getLayoutMode();
+  const prevMode = state.layout;
+  state.layout   = mode;
+
+  console.log(`[layout] mode: ${mode}, peers: ${state.peers.filter(p=>p.tileAttached).length}`);
+
+  if (mode === 'spotlight') {
+    activateSpotlightLayout();
+  } else {
+    activateGridLayout();
+  }
+}
+
+// ── SPOTLIGHT LAYOUT ────────────────────────────────
+function activateSpotlightLayout() {
+  DOM.callArea.dataset.layout = 'spotlight';
+  DOM.peerStrip.style.display = 'flex';
+  DOM.spotlight.style.display = 'block';
+
+  // Determine what goes in spotlight
+  const activeId = state.spotlight.pinnedId || state.spotlight.autoId;
+
+  if (!activeId) {
+    // Auto-select: highest priority peer
+    const best = getBestPeerForSpotlight();
+    if (best) {
+      state.spotlight.autoId = best.stableId || best.id;
+    }
+  }
+
+  refreshSpotlight();
+  refreshStripOrder();
+}
+
+// ── GRID LAYOUT ─────────────────────────────────────
+function activateGridLayout() {
+  DOM.callArea.dataset.layout = 'grid';
+  DOM.peerStrip.style.display = 'none';
+  DOM.spotlight.style.display = 'none';
+
+  // All tiles including local go into a grid inside callArea
+  ensureGridContainer();
+  refreshGridTiles();
+}
+
+function ensureGridContainer() {
+  let grid = DOM.callArea.querySelector('.peer-grid');
+  if (!grid) {
+    grid = document.createElement('div');
+    grid.className = 'peer-grid';
+    grid.id = 'peerGrid';
+    // Insert before strip so it appears first
+    DOM.callArea.insertBefore(grid, DOM.peerStrip);
+  }
+  return grid;
+}
+
+function refreshGridTiles() {
+  const grid       = ensureGridContainer();
+  const connected  = state.peers.filter(p => p.tileAttached);
+  const total      = connected.length + 1; // +1 for local
+
+  // Set grid class based on count
+  grid.className = 'peer-grid';
+  if (total <= 2) grid.classList.add('grid-2');
+  else if (total <= 4) grid.classList.add('grid-4');
+  else grid.classList.add('grid-many');
+
+  // Move local tile into grid
+  grid.appendChild(DOM.localStripTile);
+  DOM.localStripTile.classList.add('grid-tile');
+
+  // Move remote tiles into grid in priority order
+  const sorted = sortByPriority(connected);
+  sorted.forEach(entry => {
+    if (entry.tileEl) {
+      grid.appendChild(entry.tileEl);
+      entry.tileEl.classList.add('grid-tile');
+    }
+  });
+}
+
+function sortByPriority(peers) {
+  return [...peers].sort((a, b) => {
+    return getPeerPriority(b) - getPeerPriority(a);
+  });
+}
+
+function getPeerPriority(entry) {
+  if (entry.isSharingScreen)  return 3;
+  if (!entry.peerVideoOff)    return 2;
+  return 1; // voice only
+}
+
+function getBestPeerForSpotlight() {
+  const connected = state.peers.filter(p => p.tileAttached && p.status === 'connected');
+  if (!connected.length) return null;
+  return sortByPriority(connected)[0];
+}
+
+// ── STRIP ORDER ──────────────────────────────────────
+function refreshStripOrder() {
+  const activeId  = state.spotlight.pinnedId || state.spotlight.autoId;
+  const connected = state.peers.filter(p => p.tileAttached);
+  const sorted    = sortByPriority(connected);
+
+  // Local always first in strip
+  DOM.peerStrip.appendChild(DOM.localStripTile);
+  DOM.localStripTile.classList.remove('grid-tile');
+
+  sorted.forEach(entry => {
+    if (!entry.tileEl) return;
+    entry.tileEl.classList.remove('grid-tile');
+    // Hide the spotlighted peer's strip tile slightly (still there, just dimmed)
+    const isSpotlit = (entry.stableId || entry.id) === activeId;
+    entry.tileEl.classList.toggle('is-spotlighted', isSpotlit);
+    DOM.peerStrip.appendChild(entry.tileEl);
+  });
+}
+
+// ── SPOTLIGHT CONTENT ────────────────────────────────
 function refreshSpotlight() {
-  const pinned = state.spotlight.pinnedId;
-  const auto   = state.spotlight.autoId;
+  const pinned   = state.spotlight.pinnedId;
+  const auto     = state.spotlight.autoId;
   const activeId = pinned || auto;
 
   if (!activeId) {
-    // No one spotlighted — show empty state, hide unpin
     DOM.spotlightVideo.srcObject = null;
-    DOM.spotlightEmpty.style.display = 'flex';
-    DOM.btnUnpin.style.display = 'none';
+    DOM.spotlightEmpty.style.display  = 'flex';
+    DOM.btnUnpin.style.display        = 'none';
     DOM.spotlightScreenBadge.style.display = 'none';
-    DOM.spotlightName.textContent = '';
+    DOM.spotlightName.textContent     = '';
     setAvatarEl(DOM.spotlightAvatar, '', '');
     return;
   }
 
   DOM.spotlightEmpty.style.display = 'none';
-  DOM.btnUnpin.style.display = pinned ? 'flex' : 'none';
+  DOM.btnUnpin.style.display       = pinned ? 'flex' : 'none';
 
   if (activeId === 'local') {
-    // Local feed in spotlight
     DOM.spotlightVideo.srcObject = state.screenStream || state.localStream;
     DOM.spotlight.classList.toggle('is-cam', !state.screenStream);
     DOM.spotlightName.textContent = state.profile.name || 'You';
     setAvatarEl(DOM.spotlightAvatar, state.profile.avatar, state.profile.name);
     DOM.spotlightScreenBadge.style.display = state.screenStream ? 'flex' : 'none';
-    DOM.spotlightQuality.style.display = 'none';
+    DOM.spotlightQuality.style.display     = 'none';
     return;
   }
 
-  const entry = state.peers.find(pe => pe.stableId === activeId || pe.id === activeId);
+  const entry = state.peers.find(pe =>
+    pe.stableId === activeId || pe.id === activeId
+  );
   if (!entry) { clearSpotlight(); return; }
 
   DOM.spotlightVideo.srcObject = entry.remoteStream;
   DOM.spotlight.classList.remove('is-cam');
+  DOM.spotlight.classList.toggle('is-cam', !entry.isSharingScreen && !entry.peerVideoOff);
   DOM.spotlightName.textContent = entry.info?.name || 'Peer';
   setAvatarEl(DOM.spotlightAvatar, entry.info?.avatar, entry.info?.name);
-  DOM.spotlightScreenBadge.style.display = entry.isSharingScreen ? 'flex' : 'none';
-  DOM.spotlightQuality.style.display = 'flex';
+  DOM.spotlightScreenBadge.style.display  = entry.isSharingScreen ? 'flex' : 'none';
+  DOM.spotlightQuality.style.display      = 'flex';
+
+  // Show avatar overlay in spotlight if peer has video off
+  updateSpotlightAvatarOverlay(entry);
 }
 
-function pinPeer(id) {
-  state.spotlight.pinnedId = id;
-  // Mark pinned state on strip tiles
-  document.querySelectorAll('.strip-tile').forEach(t => {
-    t.classList.toggle('pinned', t.dataset.peerId === id || (id === 'local' && t.id === 'localStripTile'));
-  });
-  refreshSpotlight();
-  console.log(`[spotlight] Pinned: ${id}`);
-}
+function updateSpotlightAvatarOverlay(entry) {
+  let overlay = DOM.spotlight.querySelector('.spotlight-avatar-overlay');
+  const showOverlay = entry.peerVideoOff || false;
 
-function unpinPeer() {
-  state.spotlight.pinnedId = null;
-  document.querySelectorAll('.strip-tile').forEach(t => t.classList.remove('pinned'));
-  refreshSpotlight();
-  console.log('[spotlight] Unpinned');
+  if (showOverlay) {
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.className = 'spotlight-avatar-overlay';
+      DOM.spotlight.appendChild(overlay);
+    }
+    const av = entry.info?.avatar || '';
+    const nm = entry.info?.name   || '?';
+    overlay.innerHTML = av
+      ? `<img src="${av}" alt="${nm}" />`
+      : `<span>${nm.charAt(0).toUpperCase()}</span>`;
+  } else {
+    overlay?.remove();
+  }
 }
 
 function clearSpotlight() {
   state.spotlight.pinnedId = null;
   state.spotlight.autoId   = null;
   document.querySelectorAll('.strip-tile').forEach(t => t.classList.remove('pinned'));
-  refreshSpotlight();
+  refreshLayout();
+}
+
+function pinPeer(id) {
+  state.spotlight.pinnedId = id;
+  document.querySelectorAll('.strip-tile').forEach(t => {
+    const match = t.dataset.peerId === id ||
+      (id === 'local' && t.id === 'localStripTile');
+    t.classList.toggle('pinned', match);
+  });
+  refreshLayout();
+  console.log(`[spotlight] Pinned: ${id}`);
+}
+
+function unpinPeer() {
+  state.spotlight.pinnedId = null;
+  document.querySelectorAll('.strip-tile').forEach(t => t.classList.remove('pinned'));
+  // Auto-promote may still be active (screen share)
+  refreshLayout();
+  console.log('[spotlight] Unpinned');
 }
 
 function autoPromoteScreenShare(entry, isSharing) {
   entry.isSharingScreen = isSharing;
-  const tile = entry.tileEl;
-  if (tile) {
-    tile.classList.toggle('screen-sharing', isSharing);
-    const badge = tile.querySelector('.strip-screen-badge');
+
+  if (entry.tileEl) {
+    entry.tileEl.classList.toggle('screen-sharing', isSharing);
+    const badge = entry.tileEl.querySelector('.strip-screen-badge');
     if (badge) badge.style.display = isSharing ? 'block' : 'none';
   }
-  if (isSharing && !state.spotlight.pinnedId) {
-    state.spotlight.autoId = entry.stableId || entry.id;
-    refreshSpotlight();
-  } else if (!isSharing && state.spotlight.autoId === (entry.stableId || entry.id)) {
-    state.spotlight.autoId = null;
-    refreshSpotlight();
+
+  if (isSharing) {
+    // Only auto-promote if nothing is pinned
+    if (!state.spotlight.pinnedId) {
+      state.spotlight.autoId = entry.stableId || entry.id;
+    }
+  } else {
+    // Clear auto if this peer stopped sharing
+    if (state.spotlight.autoId === (entry.stableId || entry.id)) {
+      state.spotlight.autoId = null;
+      // Find next screen sharer if any
+      const nextSharer = state.peers.find(p =>
+        p.isSharingScreen && (p.stableId || p.id) !== (entry.stableId || entry.id)
+      );
+      if (nextSharer && !state.spotlight.pinnedId) {
+        state.spotlight.autoId = nextSharer.stableId || nextSharer.id;
+      }
+    }
   }
+
+  refreshLayout();
 }
 
 // Speaking detection via Web Audio
@@ -1184,11 +1356,9 @@ async function toggleScreenShare() {
           if (sender) sender.replaceTrack(camTrack).catch(() => {});
         });
         DOM.localVideo.srcObject = state.localStream;
-        setLocalVideoMirror(false);//true);
+        setLocalVideoMirror(true);
         DOM.localStripTile.classList.remove('screen-sharing');
-        if (state.spotlight.pinnedId === 'local' || state.spotlight.autoId === 'local') {
-          refreshSpotlight();
-        }
+        autoPromoteScreenShare({ stableId: 'local', id: 'local', tileEl: DOM.localStripTile }, false);
       }
     }
     return;
@@ -1201,10 +1371,8 @@ async function toggleScreenShare() {
     DOM.localVideo.srcObject = ss;
     setLocalVideoMirror(false);
     DOM.localStripTile.classList.add('screen-sharing');
-    if (!state.spotlight.pinnedId) {
-      state.spotlight.autoId = 'local';
-      refreshSpotlight();
-    }
+    // Treat local as a fake entry for the promotion system
+    autoPromoteScreenShare({ stableId: 'local', id: 'local', tileEl: DOM.localStripTile }, true);
     state.peers.forEach(pe => {
       const sender = pe.pc.getSenders().find(s => s.track?.kind === 'video');
       if (sender) sender.replaceTrack(screenTrack).catch(() => {});
@@ -1238,6 +1406,28 @@ function createPeer(id) {
   pc.ontrack = e => {
     e.streams[0]?.getTracks().forEach(t => remoteStream.addTrack(t));
     if (entry.videoEl) entry.videoEl.srcObject = remoteStream;
+
+    // Detect screen share by checking video track settings
+    e.streams[0]?.getVideoTracks().forEach(track => {
+      track.onended = () => {
+        // Remote peer stopped sharing
+        if (entry.isSharingScreen) {
+          autoPromoteScreenShare(entry, false);
+        }
+      };
+      // Poll track settings to detect screen share resolution
+      const checkScreenShare = setInterval(() => {
+        if (!entry.pc || entry.pc.connectionState === 'closed') {
+          clearInterval(checkScreenShare);
+          return;
+        }
+        const settings = track.getSettings();
+        const isScreen = settings.width > 1200 || settings.displaySurface !== undefined;
+        if (isScreen !== !!entry.isSharingScreen) {
+          autoPromoteScreenShare(entry, isScreen);
+        }
+      }, 2000);
+    });
   };
 
   pc.onicecandidate = () => {};
@@ -1606,12 +1796,6 @@ function addRemoteTile(entry) {
   };
 }
 
-function refreshLayout() {
-  // If no peers, hide strip (just local tile stays)
-  // Strip is always visible — layout engine is CSS flex
-  refreshSpotlight();
-}
-
 function updatePeerCardState(entry) {
   if (!entry.tileEl) return;
 
@@ -1644,6 +1828,16 @@ function updatePeerCardState(entry) {
 
   // Update strip tile class for video state
   entry.tileEl.classList.toggle('video-off', !!entry.peerVideoOff);
+
+  // Refresh priority class for grid layout
+  const priority = getPeerPriority(entry);
+  entry.tileEl?.classList.remove('priority-high', 'priority-mid', 'priority-low');
+  entry.tileEl?.classList.add(
+    priority === 3 ? 'priority-high' :
+    priority === 2 ? 'priority-mid'  : 'priority-low'
+  );
+  // Re-sort grid if in grid mode
+  if (state.layout === 'grid') refreshGridTiles();
 }
 
 function updatePeerTileStatus(entry) {
@@ -1690,10 +1884,12 @@ function removePeer(id) {
   entry.pc.close();
   entry.tileEl?.remove();
   stopSpeakingDetection(entry.id);
-  id = entry.stableId || entry.id;
-  if (state.spotlight.pinnedId === id) unpinPeer();
-  if (state.spotlight.autoId   === id) { state.spotlight.autoId = null; refreshSpotlight(); }
-  state.peers.splice(idx, 1);
+  const id = entry.stableId || entry.id;
+  const wasPinned = state.spotlight.pinnedId === id;
+  const wasAuto   = state.spotlight.autoId   === id;
+  if (wasPinned) state.spotlight.pinnedId = null;
+  if (wasAuto)   state.spotlight.autoId   = null;
+  // Layout will auto-return to grid if peer count drops below threshold
   refreshLayout();
   updateGlobalStatus();
 }

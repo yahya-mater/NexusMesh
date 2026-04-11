@@ -232,6 +232,7 @@ input, textarea { font-family: inherit; }
   border: 1px solid var(--border);
   transition: border-color var(--transition-lg);
   min-width: 0;
+  display: none; /* hidden until layout engine activates it */
 }
 .spotlight video {
   width: 100%; height: 100%;
@@ -466,7 +467,7 @@ input, textarea { font-family: inherit; }
 /* ═══════════════════════════════ PEER STRIP (sidebar) */
 .peer-strip {
   width: var(--strip-w);
-  display: flex;
+  display: none; /* hidden until layout engine activates it */
   flex-direction: column;
   gap: 6px;
   overflow-y: auto;

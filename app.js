@@ -157,8 +157,16 @@ function refreshLayout() {
 // ── SPOTLIGHT LAYOUT ────────────────────────────────
 function activateSpotlightLayout() {
   DOM.callArea.dataset.layout = 'spotlight';
-  DOM.peerStrip.style.display = 'flex';
-  DOM.spotlight.style.display = 'block';
+  DOM.peerStrip.style.display  = 'flex';
+  DOM.spotlight.style.display  = 'block';
+
+  // Hide grid container if it exists
+  const grid = DOM.callArea.querySelector('.peer-grid');
+  if (grid) grid.style.display = 'none';
+
+  // Move local tile back to strip when entering spotlight mode
+  DOM.peerStrip.appendChild(DOM.localStripTile);
+  DOM.localStripTile.classList.remove('grid-tile');
 
   // Determine what goes in spotlight
   const activeId = state.spotlight.pinnedId || state.spotlight.autoId;
@@ -178,11 +186,11 @@ function activateSpotlightLayout() {
 // ── GRID LAYOUT ─────────────────────────────────────
 function activateGridLayout() {
   DOM.callArea.dataset.layout = 'grid';
-  DOM.peerStrip.style.display = 'none';
-  DOM.spotlight.style.display = 'none';
+  DOM.peerStrip.style.display  = 'none';
+  DOM.spotlight.style.display  = 'none';
 
-  // All tiles including local go into a grid inside callArea
-  ensureGridContainer();
+  const grid = ensureGridContainer();
+  grid.style.display = 'grid';
   refreshGridTiles();
 }
 
@@ -1266,6 +1274,8 @@ function setAvatarEl(el, avatar, name) {
 function showCallScreen() {
   DOM.splash.classList.remove('active');
   DOM.callScreen.classList.add('active');
+  // Run layout engine immediately so grid is shown not empty spotlight
+  refreshLayout();
 }
 function showSplash() {
   DOM.callScreen.classList.remove('active');
@@ -1774,11 +1784,11 @@ function addRemoteTile(entry) {
   controls.append(pinBtn, muteVidBtn, muteAudBtn);
 
   // Click tile to pin
-  tile.onclick = () => {
-    const id = entry.stableId || entry.id;
-    if (state.spotlight.pinnedId === id) unpinPeer();
-    else pinPeer(id);
-  };
+  // tile.onclick = () => {
+  //   const id = entry.stableId || entry.id;
+  //   if (state.spotlight.pinnedId === id) unpinPeer();
+  //   else pinPeer(id);
+  // };
 
   tile.append(video, noCam, statusBadge, overlay, screenBadge, controls);
   DOM.peerStrip.appendChild(tile);
@@ -2823,16 +2833,16 @@ DOM.btnCloseSignaling.onclick = () => hideModal('signalingModal');
 DOM.btnCloseSettings.onclick = () => hideModal('settingsModal');
 
 // Spotlight controls
-DOM.btnUnpin.onclick  = unpinPeer;
-DOM.btnPinLocal.onclick = () => {
-  if (state.spotlight.pinnedId === 'local') unpinPeer();
-  else pinPeer('local');
-};
-DOM.localStripTile.onclick = e => {
-  if (e.target.closest('.strip-btn')) return; // don't pin when clicking control buttons
-  if (state.spotlight.pinnedId === 'local') unpinPeer();
-  else pinPeer('local');
-};
+// DOM.btnUnpin.onclick  = unpinPeer;
+// DOM.btnPinLocal.onclick = () => {
+//   if (state.spotlight.pinnedId === 'local') unpinPeer();
+//   else pinPeer('local');
+// };
+// DOM.localStripTile.onclick = e => {
+//   if (e.target.closest('.strip-btn')) return;
+//   if (state.spotlight.pinnedId === 'local') unpinPeer();
+//   else pinPeer('local');
+// };
 
 // Close modals on overlay click
 document.querySelectorAll('.modal-overlay').forEach(overlay => {

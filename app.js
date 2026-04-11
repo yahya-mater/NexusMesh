@@ -1884,7 +1884,7 @@ function removePeer(id) {
   entry.pc.close();
   entry.tileEl?.remove();
   stopSpeakingDetection(entry.id);
-  const id = entry.stableId || entry.id;
+  id = entry.stableId || entry.id;
   const wasPinned = state.spotlight.pinnedId === id;
   const wasAuto   = state.spotlight.autoId   === id;
   if (wasPinned) state.spotlight.pinnedId = null;

@@ -2976,11 +2976,11 @@ DOM.btnCloseSignaling.onclick = () => hideModal('signalingModal');
 DOM.btnCloseSettings.onclick = () => hideModal('settingsModal');
 
 // Spotlight controls
-// DOM.btnUnpin.onclick  = unpinPeer;
-// DOM.btnPinLocal.onclick = () => {
-//   if (state.spotlight.pinnedId === 'local') unpinPeer();
-//   else pinPeer('local');
-// };
+DOM.btnUnpin.onclick  = unpinPeer;
+DOM.btnPinLocal.onclick = () => {
+  if (state.spotlight.pinnedId === 'local') unpinPeer();
+  else pinPeer('local');
+};
 // DOM.localStripTile.onclick = e => {
 //   if (e.target.closest('.strip-btn')) return;
 //   if (state.spotlight.pinnedId === 'local') unpinPeer();

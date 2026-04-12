@@ -136,7 +136,8 @@ function getLayoutMode() {
   const hasAutoPromote = !!state.spotlight.autoId;
   const peerCount     = state.peers.filter(p => p.tileAttached).length;
   // Spotlight mode when: something pinned, screen share active, or 5+ peers
-  if (hasPinned || hasAutoPromote || peerCount >= 4) return 'spotlight';
+  //if (hasPinned || hasAutoPromote || peerCount >= 4) return 'spotlight';
+  if (hasPinned || peerCount >= 4) return 'spotlight';
   return 'grid';
 }
 
@@ -484,7 +485,7 @@ async function updateQuality(entry) {
 
     const tileEl = entry.tileEl?.querySelector(`[data-quality-for="${entry.id}"]`);
     console.log(`[quality:check] tile quality el found: ${!!tileEl}, looking for data-quality-for="${entry.id}"`);
-    
+
     const lossRate = lost / (sent + lost || 1);
 
     // Score 0-3: 3=excellent 2=good 1=poor 0=bad

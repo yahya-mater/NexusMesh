@@ -455,35 +455,127 @@ async function updateQuality(entry) {
   if (!entry.pc || entry.status !== 'connected') return;
   try {
     const stats = await entry.pc.getStats();
-    let rtt = null, lost = 0, sent = 0;
+    let rtt = null, lost = 0, sent = 0, jitter = 0, bandwidth = 0;
+
     stats.forEach(r => {
-      if (r.type === 'remote-inbound-rtp' && r.kind === 'video') {
-        rtt  = r.roundTripTime;
-        lost = r.packetsLost || 0;
-        sent = r.packetsSent || 1;
+      // Outbound video — available bitrate
+      if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+        if (r.availableOutgoingBitrate) {
+          bandwidth = Math.round(r.availableOutgoingBitrate / 1000); // kbps
+        }
+        if (r.currentRoundTripTime != null) {
+          rtt = r.currentRoundTripTime * 1000; // convert to ms
+        }
+      }
+      // Inbound video — packet loss and jitter
+      if (r.type === 'inbound-rtp' && r.kind === 'video') {
+        lost   = r.packetsLost   || 0;
+        sent   = r.packetsReceived || 1;
+        jitter = (r.jitter || 0) * 1000; // ms
       }
     });
-    const lossRate = lost / sent;
-    // 0=good 1=ok 2=poor
-    const level = rtt === null ? 0 : rtt > .3 || lossRate > .05 ? 2 : rtt > .15 || lossRate > .02 ? 1 : 0;
-    updateQualityBars(entry, level);
-  } catch {}
+
+    const lossRate = lost / (sent + lost || 1);
+
+    // Score 0-3: 3=excellent 2=good 1=poor 0=bad
+    let score = 3;
+    if (rtt > 300  || lossRate > .08 || jitter > 80)  score = 0;
+    else if (rtt > 150 || lossRate > .04 || jitter > 40) score = 1;
+    else if (rtt > 80  || lossRate > .01 || jitter > 20) score = 2;
+
+    entry.qualityScore = score;
+    entry.qualityStats = {
+      rtt:       rtt != null ? Math.round(rtt) : null,
+      loss:      Math.round(lossRate * 100),
+      jitter:    Math.round(jitter),
+      bandwidth,
+    };
+
+    adaptQualityToConnection(entry);
+
+    updateQualityBars(entry, score);
+    updateStripTileQuality(entry);
+    console.log(`[quality] ${entry.info?.name || entry.id} — RTT:${entry.qualityStats.rtt}ms loss:${entry.qualityStats.loss}% jitter:${entry.qualityStats.jitter}ms bw:${bandwidth}kbps score:${score}`);
+  } catch (e) {
+    console.warn('[quality] getStats failed:', e);
+  }
 }
 
-function updateQualityBars(entry, level) {
-  // Update strip tile quality if we add it later
-  // Update spotlight quality if this peer is spotlighted
-  const id = entry.stableId || entry.id;
-  if ((state.spotlight.pinnedId || state.spotlight.autoId) !== id) return;
-  const bars = DOM.spotlightQuality.querySelectorAll('.quality-bar');
+async function adaptQualityToConnection(entry) {
+  const score = entry.qualityScore ?? 3;
+  const senders = entry.pc.getSenders();
+
+  for (const sender of senders) {
+    if (sender.track?.kind !== 'video') continue;
+    const params = sender.getParameters();
+    if (!params.encodings?.length) continue;
+
+    // Reduce quality progressively as score drops
+    const bitrates   = [150_000, 300_000, 500_000, 800_000]; // score 0-3
+    const framerates = [8, 15, 24, 30];
+    const scales     = [3, 2, 1.5, 1];
+
+    params.encodings[0].maxBitrate             = bitrates[score];
+    params.encodings[0].maxFramerate           = framerates[score];
+    params.encodings[0].scaleResolutionDownBy  = scales[score];
+
+    await sender.setParameters(params).catch(() => {});
+    console.log(`[quality] Adapted ${entry.info?.name} to score ${score} — ${bitrates[score]/1000}kbps`);
+  }
+}
+
+function updateStripTileQuality(entry) {
+  const el = entry.tileEl?.querySelector(`[data-quality-for="${entry.id}"]`);
+  if (!el) return;
+  const score = entry.qualityScore ?? 3;
+  const bars  = el.querySelectorAll('.sq-bar');
   bars.forEach((b, i) => {
     b.classList.remove('active', 'warn', 'poor');
-    if (i <= (2 - level)) {
+    if (i < score) {
       b.classList.add('active');
-      if (level === 1) b.classList.add('warn');
-      if (level === 2) b.classList.add('poor');
+      if (score === 1) b.classList.add('poor');
+      if (score === 2) b.classList.add('warn');
     }
   });
+  // Tooltip with raw stats
+  const s = entry.qualityStats;
+  if (s) {
+    const rttTxt  = s.rtt != null ? `RTT: ${s.rtt}ms` : 'RTT: —';
+    const lossTxt = `Loss: ${s.loss}%`;
+    const jitTxt  = `Jitter: ${s.jitter}ms`;
+    const bwTxt   = s.bandwidth ? `BW: ${s.bandwidth}kbps` : '';
+    el.title = [rttTxt, lossTxt, jitTxt, bwTxt].filter(Boolean).join(' · ');
+  }
+}
+
+function updateQualityBars(entry, score) {
+  const id = entry.stableId || entry.id;
+  if ((state.spotlight.pinnedId || state.spotlight.autoId) !== id) return;
+
+  DOM.spotlightQuality.style.display = 'flex';
+  const bars = DOM.spotlightQuality.querySelectorAll('.quality-bar');
+
+  // Bars fill left to right: score 3 = all lit, 0 = none lit
+  bars.forEach((b, i) => {
+    b.classList.remove('active', 'warn', 'poor');
+    if (i < score) {
+      b.classList.add('active');
+      if (score === 1) b.classList.add('poor');
+      if (score === 2) b.classList.add('warn');
+    }
+  });
+
+  // Update spotlight tooltip
+  const s = entry.qualityStats;
+  if (s) {
+    const label =
+      score === 3 ? 'Excellent' :
+      score === 2 ? 'Good' :
+      score === 1 ? 'Poor' : 'Bad';
+    const rttTxt = s.rtt != null ? ` · RTT ${s.rtt}ms` : '';
+    const lossTxt = s.loss > 0 ? ` · ${s.loss}% loss` : '';
+    DOM.spotlightQuality.title = `${label}${rttTxt}${lossTxt}`;
+  }
 }
 
 // Poll quality every 5 seconds for connected peers
@@ -534,6 +626,23 @@ function decode(str) {
     console.warn(`[decode] ✗ Failed:`, err.message);
     console.warn(`[decode] Input (first 80 chars): ${String(str).slice(0, 80)}`);
     return null;
+  }
+}
+
+async function applyEncodingConstraints(pc) {
+  const senders = pc.getSenders();
+  for (const sender of senders) {
+    if (sender.track?.kind !== 'video') continue;
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    // Cap at 500kbps for camera, 1.5Mbps for screen share
+    const isScreen = !!state.screenStream;
+    params.encodings[0].maxBitrate    = isScreen ? 1_500_000 : 500_000;
+    params.encodings[0].maxFramerate  = isScreen ? 15 : 24;
+    params.encodings[0].scaleResolutionDownBy = isScreen ? 1 : 1.5; // 720p→480p
+    await sender.setParameters(params).catch(() => {});
   }
 }
 
@@ -1289,7 +1398,16 @@ async function startLocalMedia() {
 
   // ── Mic
   try {
-    const audioStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+    //const audioStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+    const audioStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation:    true,
+        noiseSuppression:    true,
+        autoGainControl:     true,
+        channelCount:        1,       // mono — halves audio bandwidth
+        sampleRate:          16000,   // 16kHz sufficient for voice
+      }
+    });
     audioStream.getAudioTracks().forEach(t => {
       state.localStream.addTrack(t);
       console.log(`[media] ✓ Audio track acquired: ${t.label}`);
@@ -1301,7 +1419,16 @@ async function startLocalMedia() {
 
   // ── Camera (asked separately so mic-only works if cam denied)
   try {
-    const videoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    //const videoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    const videoStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width:     { ideal: 1280, max: 1920 },
+        height:    { ideal: 720,  max: 1080 },
+        frameRate: { ideal: 24,   max: 30   },
+      },
+      audio: false,
+    });
+    
     videoStream.getVideoTracks().forEach(t => {
       state.localStream.addTrack(t);
       console.log(`[media] ✓ Video track acquired: ${t.label}`);
@@ -1726,6 +1853,11 @@ function addRemoteTile(entry) {
     <div class="strip-tile-name">
       <span class="mini-avatar" data-avatar-for="${entry.id}">?</span>
       <span data-name-for="${entry.id}">Connecting…</span>
+      <div class="strip-quality" data-quality-for="${entry.id}" title="">
+        <div class="sq-bar"></div>
+        <div class="sq-bar"></div>
+        <div class="sq-bar"></div>
+      </div>
     </div>`;
 
   const screenBadge = document.createElement('div');
@@ -1853,17 +1985,26 @@ function updatePeerCardState(entry) {
 function updatePeerTileStatus(entry) {
   if (!entry.statusEl) return;
   const labels = {
-    new: 'New', connecting: 'Connecting…', connected: 'Connected',
-    disconnected: 'Reconnecting…', failed: 'Failed', closed: 'Closed',
+    new:          'New',
+    connecting:   'Connecting…',
+    connected:    'Connected',
+    disconnected: 'Reconnecting…',
+    failed:       'Failed',
+    closed:       'Closed',
   };
   entry.statusEl.textContent = labels[entry.status] || entry.status;
-  entry.statusEl.style.color = entry.status === 'connected' ? 'var(--success)' :
-    entry.status === 'failed' ? 'var(--danger)' : 'var(--txt-2)';
-  // Hide status badge once connected
-  if (entry.statusEl) {
-    entry.statusEl.style.display = entry.status === 'connected' ? 'none' : 'block';
-  }
-  entry.tileEl?.classList.toggle('is-connecting', entry.status === 'connecting' || entry.status === 'new');
+  entry.statusEl.style.color =
+    entry.status === 'connected'    ? 'var(--success)' :
+    entry.status === 'failed'       ? 'var(--danger)'  : 'var(--txt-2)';
+  entry.statusEl.style.display =
+    entry.status === 'connected' ? 'none' : 'block';
+
+  const isConnecting = entry.status === 'connecting' || entry.status === 'new';
+  entry.tileEl?.classList.toggle('is-connecting', isConnecting);
+
+  // Show/hide quality bars — only meaningful when connected
+  const qualityEl = entry.tileEl?.querySelector(`[data-quality-for="${entry.id}"]`);
+  if (qualityEl) qualityEl.style.display = entry.status === 'connected' ? 'flex' : 'none';
 }
 
 function updatePeerTileInfo(entry) {
@@ -2075,6 +2216,8 @@ async function joinCall(offerData, roomId) {
 
   const answer = await entry.pc.createAnswer();
   await entry.pc.setLocalDescription(answer);
+
+  await applyEncodingConstraints(entry.pc);
 
   await waitForICE(entry.pc);
 

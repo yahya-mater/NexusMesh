@@ -325,10 +325,40 @@ input, textarea { font-family: inherit; }
 .unpin-btn svg { width: 13px; height: 13px; }
 
 /* Quality indicator */
+/* ── Spotlight quality bars */
 .quality-indicator {
   display: flex; gap: 2px; align-items: flex-end;
-  pointer-events: none;
+  pointer-events: none; cursor: help;
 }
+.quality-bar {
+  width: 4px; border-radius: 2px;
+  background: rgba(255,255,255,.15);
+  transition: background .4s ease;
+}
+.quality-bar:nth-child(1) { height: 6px; }
+.quality-bar:nth-child(2) { height: 10px; }
+.quality-bar:nth-child(3) { height: 14px; }
+.quality-bar.active              { background: var(--success); }
+.quality-bar.active.warn         { background: var(--warn); }
+.quality-bar.active.poor         { background: var(--danger); }
+
+/* ── Strip tile quality bars */
+.strip-quality {
+  display: flex; gap: 2px; align-items: flex-end;
+  margin-left: auto; flex-shrink: 0;
+  cursor: help;
+}
+.sq-bar {
+  width: 3px; border-radius: 1px;
+  background: rgba(255,255,255,.15);
+  transition: background .4s ease;
+}
+.sq-bar:nth-child(1) { height: 5px; }
+.sq-bar:nth-child(2) { height: 8px; }
+.sq-bar:nth-child(3) { height: 11px; }
+.sq-bar.active       { background: var(--success); }
+.sq-bar.active.warn  { background: var(--warn); }
+.sq-bar.active.poor  { background: var(--danger); }
 .quality-bar {
   width: 4px; border-radius: 2px;
   background: rgba(255,255,255,.2);

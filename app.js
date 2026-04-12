@@ -458,32 +458,33 @@ async function updateQuality(entry) {
 
   try {
     const stats = await entry.pc.getStats();
-    let rtt = null, lost = 0, sent = 0, jitter = 0, bandwidth = 0;
+    let rtt               = null;
+    let lost              = 0;
+    let sent              = 0;
+    let jitter            = 0;
+    let bandwidth         = 0;
+    let foundCandidatePair = false;
+    let foundInboundRtp    = false;
 
     stats.forEach(r => {
-      // Outbound video — available bitrate
       if (r.type === 'candidate-pair' && r.state === 'succeeded') {
-        if (r.availableOutgoingBitrate) {
-          bandwidth = Math.round(r.availableOutgoingBitrate / 1000); // kbps
-        }
-        if (r.currentRoundTripTime != null) {
-          rtt = r.currentRoundTripTime * 1000; // convert to ms
-        }
+        foundCandidatePair = true;
+        if (r.availableOutgoingBitrate) bandwidth = Math.round(r.availableOutgoingBitrate / 1000);
+        if (r.currentRoundTripTime != null) rtt = r.currentRoundTripTime * 1000;
       }
-      // Inbound video — packet loss and jitter
       if (r.type === 'inbound-rtp' && r.kind === 'video') {
-        lost   = r.packetsLost   || 0;
+        foundInboundRtp = true;
+        lost   = r.packetsLost     || 0;
         sent   = r.packetsReceived || 1;
-        jitter = (r.jitter || 0) * 1000; // ms
+        jitter = (r.jitter || 0) * 1000;
       }
     });
 
     console.log(`[quality:check] candidatePair: ${foundCandidatePair}, inboundRtp: ${foundInboundRtp}, rtt: ${rtt}, sent: ${sent}, lost: ${lost}`);
 
-    // Check tile element lookup
     const tileEl = entry.tileEl?.querySelector(`[data-quality-for="${entry.id}"]`);
     console.log(`[quality:check] tile quality el found: ${!!tileEl}, looking for data-quality-for="${entry.id}"`);
-
+    
     const lossRate = lost / (sent + lost || 1);
 
     // Score 0-3: 3=excellent 2=good 1=poor 0=bad
